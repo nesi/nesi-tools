@@ -1,0 +1,682 @@
+#!/bin/bash -e
+
+# nn_archive_files
+#
+# A wrapper to bundle a list of files up into a SquashFS archive, creating
+# a list of checksums in the process (to help the user to identify bitrot
+# later).
+#
+# This is in nesitools rather than nearline because, although it is useful
+# for those wishing to archive data on nearline, that's not the only valid
+# use case. It could also be helpful for those wanting to move data to their
+# institutions or to third-party storage.
+#
+# Author: Benjamin P. Roberts, May 2020
+# Updated August 2021
+
+function error_exit() {
+	/usr/bin/echo "$1" >&2
+	exit 2
+}
+
+function print_help_and_exit() {
+
+	/usr/bin/cat << EOM
+${usage_string}
+
+Bundle up one or more files or directories into a SquashFS bundle, and
+optionally transfer it to the nearline service using the Nearline tool.
+
+OPTIONS
+
+-a, --append-to-checksum-file
+        If a checksum file (checksums.txt) already exists in the working
+        directory, append to it and don't delete the file when finishing. Not
+        valid with -c none (--checksums=none).
+
+-c ALGORITHM, --checksums=ALGORITHM
+        Choice of checksum algorithm to use when preparing the index of files.
+        Default: sha256
+        Valid options: sha256, sha1, md5, none (case insensitive)
+
+-d, --delete-files
+        Delete the files that were bundled up into the SquashFS archive. Not
+        to be used with -k (--keep-files).
+
+--dependency=JOB_ID
+        Do not start until the specified job is finished. Not to be used with
+	-i (--interactive).
+
+-g, --debug
+        Run in debug mode. Implies -v (--verbose).
+
+-h, --help
+        Print this help and exit.
+
+-i, --interactive
+        Run this command interactively instead of submitting it as a Slurm job.
+        This option will cause -t (--time-limit) to be ignored, and -p
+        (--project-code) to have no effect unless -x (--run-nlput) or -o
+        (--table-of-contents) is also used. Not to be used with --dependency.
+
+-k, --keep-files
+        Keep copies of the files that were bundled up into the SquashFS
+        archive. Not to be used with -d (--delete-files). This is the default
+        option.
+
+-n NUM, --num-processors=NUM
+        The number of processors to use when archiving files, and also when
+        extracting files if verification is selected. Default 1.
+
+-o, --table-of-contents
+        Append the path to the created SquashFS file and its contents to the
+        file /nesi/project/PROJECT_CODE/squashfs_files.txt. Requires a project
+        code to be specified using -p (--project-code).
+
+-p CODE, --project-code=CODE
+        The project code to be used as a Slurm account. Will be ignored if used
+        alongside -i (--interactive). Must be supplied if -x (--run-nlput) or -o
+        (--table-of-contents) is used, or if -i (--interactive) is not used.
+
+-t HH:MM:SS, --time-limit=HH:MM:SS
+        The walltime maximum to be used in a Slurm job. Will be ignored if used
+        alongside -i (--interactive).
+
+-v, --verbose
+        Run in verbose mode. Implied by -g (--debug).
+
+--verify
+        Verify the archived files by extracting them from the archive,
+        checksumming the extracted files and comparing the checksums to what
+        is present in the archive.
+
+-x, --run-nlput
+        Run the nlput utility to move the SquashFS archive to the NeSI nearline
+        system. Requires -p (or --project-code).
+
+EOM
+	exit 0
+}
+
+progname=$(/usr/bin/basename $0)
+usage_string="usage: ${progname} [ OPTION ... ] -- FILE [ FILE ... ] DESTINATION [ MKSQUASHFS_OPTIONS ]"
+
+append_to_checksum_file=false
+checksums="sha256"
+debug=false
+deletefiles=false
+dependency=""
+do_checksums=true
+interactive=false
+keepfiles=false
+nearline_version="1.1.0.22"
+nlput=false
+projectcode=""
+table_of_contents=false
+timelimit=""
+temporary_file=""
+slurm_script=""
+verbose=false
+verify=false
+unsquashfs_options=""
+
+if [[ $# -eq 0 ]]
+then
+	error_exit "${usage_string}"
+fi
+
+# Execute getopt
+ARGS=$(getopt -o ac:dghikn:op:t:vx -l "append-to-checksum-file,checksums:,delete-files,debug,dependency:,help,interactive,keep-files,num-processors:,table-of-contents,project-code:,time-limit:,verbose,verify,run-nlput" -n "${progname}" -- "$@");
+ 
+#Bad arguments
+if [ $? -ne 0 ]
+then
+	exit 2
+fi
+eval set -- "$ARGS"
+
+while true
+do
+	case "$1" in
+		-h|--help)
+			print_help_and_exit
+			;;
+		-a|--append-to-checksum-file)
+			shift
+			append_to_checksum_file=true
+			;;
+		-c|--checksums)
+			shift
+			if [ -n "${1}" ]
+			then
+				checksums=$(echo "${1}" | /usr/bin/tr '[:upper:]' '[:lower:]')
+				shift
+			fi
+			;;
+		-d|--delete-files)
+			shift
+			deletefiles=true
+			;;
+		--dependency)
+			shift
+			if [ -n "${1}" ]
+			then
+				dependency=$1
+				shift
+			fi
+			;;
+		-g|--debug)
+			shift
+			debug=true
+			verbose=true
+			set -x
+			;;
+		-i|--interactive)
+			shift
+			interactive=true
+			;;
+		-k|--keep-files)
+			shift
+			keepfiles=true
+			;;
+		-n|--num-processors)
+			shift
+			if [ -n "${1}" ]
+			then
+				numprocs="${1}"
+				shift
+			fi
+			;;
+		-o|--table-of-contents)
+			shift
+			table_of_contents=true
+			;;
+		-p|--project-code)
+			shift
+			if [ -n "$1" ]
+			then
+				projectcode="${1}"
+				shift
+			fi
+			;;
+		-t|--time-limit)
+			shift
+			if [ -n "${1}" ]
+			then
+				timelimit="${1}"
+				shift
+			fi
+			;;
+		-v|--verbose)
+			shift
+			verbose=true
+			;;
+		--verify)
+			shift
+			verify=true
+			;;
+		-x|--run-nlput)
+			shift
+			nlput=true
+			;;
+		--)
+			shift
+			break
+			;;
+	esac
+done
+
+if [[ "${append_to_checksum_file}" == "true" && "${checksums}" == "none" ]]
+then
+	/usr/bin/echo "Error: ${progname}: -a (or --append-to-checksum-file) was used with --checksums=none" >&2
+	error_exit "${usage_string}"
+fi
+if [[ "${keepfiles}" == "false" && "${deletefiles}" == "false" ]]
+then
+	keepfiles=true
+fi
+if [[ "${keepfiles}" == "${deletefiles}" ]]
+then
+	/usr/bin/echo "Error: ${progname}: -d (or --delete-files) and -k (or --keep-files) were used together" >&2
+	error_exit "${usage_string}"
+fi
+
+# Probably no need for this as we give explicit paths, and /usr/sbin is often not on a user's path
+#which mksquashfs > /dev/null
+#if [[ $? -ne 0 ]]
+#then
+#	error_exit "Error: ${progname}: no mksquashfs executable found on this host"
+#fi
+
+clustername=$(/opt/slurm/bin/scontrol show config | /usr/bin/grep -i ClusterName | /usr/bin/awk '{print $3}')
+if [[ "${nlput}" == "true" ]]
+then
+	if [[ -z "${projectcode}" ]]
+	then
+		error_exit "Error: ${progname}: -x (or --run-nlput) requires -p (or --project-code)"
+	fi
+	cwd=$(/usr/bin/pwd -L)
+	case "${cwd}" in
+		/nesi/project/${projectcode}|/nesi/project/${projectcode}/*|/nesi/nobackup/${projectcode}|/nesi/nobackup/${projectcode}/*)
+			:
+			;;
+		*)
+			error_exit "Error: ${progname}: -x (or --run-nlput) requires being in your project's persistent or nobackup directory"
+	esac
+fi
+
+if [[ "${table_of_contents}" == "true" ]]
+then
+	if [[ -z "${projectcode}" ]]
+	then
+		error_exit "Error: ${progname}: -o (or --table-of-contents) requires -p (or --project-code)"
+	fi
+fi
+
+if [[ "${interactive}" == "true" ]]
+then
+	if [[ -n "${dependency}" ]]
+	then
+		error_exit "Error: ${progname}: -i (or --interactive) was used with --dependency"
+	else
+		if [[ "${table_of_contents}" == "false" && -n "${projectcode}" ]]
+		then
+			/usr/bin/echo "Warning: ${progname}: if -i (or --interactive) is used and -o (or"
+			/usr/bin/echo "--table-of-contents) is not, -p (or --project-code) will be ignored"
+		fi
+		if [[ -n "${timelimit}" ]]
+		then
+			/usr/bin/echo "Warning: ${progname}: -t (or --time-limit) is ignored when used with -i"
+			/usr/bin/echo "(or --interactive)"
+		fi
+	fi
+else
+	if [[ -z "${numprocs}" ]]
+	then
+		/usr/bin/echo "Error: ${progname}: You must use either -n (or --num-processors) or -i" >&2
+		error_exit "(or --interactive)."
+	elif [[ ! "${numprocs}" =~ ^[0-9]+$ ]] || [[ "${numprocs}" -lt 1 ]]
+	then
+		error_exit "Error: ${progname}: -n, --num-processors: Expected a positive integer but found ${numprocs}"
+	fi
+	if [[ -n "${dependency}" ]]
+	then
+		if [[ ! "${dependency}" =~ ^[0-9]+$ ]] || [[ "${dependency}" -lt 1 ]]
+		then
+			error_exit "Error: ${progname}: --dependency: Expected a positive integer but found ${dependency}"
+		fi
+	fi
+	if [[ -z "${projectcode}" ]]
+	then
+		error_exit "Error: ${progname}: You must use either -p (or --project-code) or -i (or --interactive)"
+	fi
+	if [[ -z "${timelimit}" ]]
+	then
+		error_exit "Error: ${progname}: You must use either -t (or --time-limit) or -i (or --interactive)"
+	fi
+	case "${clustername}" in
+		maui_ancil|mahuika)
+			:
+			;;
+		maui)
+			/usr/bin/echo "Note: ${progname}: Must use 80 logical CPU cores when running on Maui"
+			numprocs=80
+			;;
+		*)
+			error_exit "Error: ${progname}: don't know how to submit Slurm jobs on cluster ${clustername}"
+			;;
+	esac
+fi
+
+# Get all arguments except the last and put them into a list
+files_to_squash=()
+n=0
+previous_argument=""
+for i in "$@"
+do
+	if [[ -n "${previous_argument}" ]]
+	then
+		if [[ "${i}" == -* ]]
+		then
+			dest="${previous_argument}"
+			previous_argument=""
+			break
+		else
+			files_to_squash+=("${previous_argument}")
+		fi
+	fi
+	previous_argument="${i}"
+	shift
+done
+if [[ -n "${previous_argument}" ]]
+then
+	dest="${previous_argument}"
+fi
+
+if [[ "${#files_to_squash[@]}" -lt 1 ]]
+then
+	/usr/bin/echo "Error: ${progname}: no files were selected to archive" >&2
+	error_exit "${usage_string}"
+elif [[ -z "${dest}" ]]
+then
+	/usr/bin/echo "Error: ${progname}: no destination filename specified" >&2
+	error_exit "${usage_string}"
+fi
+mksquashfs_options="$@"
+
+case "${checksums}" in
+	md5)
+		checksum_exe="/usr/bin/md5sum"
+		;;
+	sha1)
+		checksum_exe="/usr/bin/sha1sum"
+		;;
+	sha256)
+		checksum_exe="/usr/bin/sha256sum"
+		;;
+	none)
+		checksum_exe=""
+		do_checksum=false
+		;;
+	*)
+		message="Error: ${progname}: \"${checksums}\" is not a supported checksum algorithm.
+Please select one of: md5, sha1, sha256, none"
+		error_exit "${message}"
+		;;
+esac
+
+slurm_script_exists=true
+while [[ "${slurm_script_exists}" == "true" ]]
+do
+	slurm_script="${progname}-$(/usr/bin/uuidgen).sl"
+	if [[ ! -e "${slurm_script}" ]]
+	then
+		slurm_script_exists=false
+	fi
+done
+/usr/bin/touch "${slurm_script}"
+if [ $? -ne 0 ]
+then
+	error_exit "Error: ${progname}: Could not create file ${slurm_script}"
+fi
+
+if [[ "${verify}" == "true" ]]
+then
+	if [[ "${interactive}" == "false" ]]
+	then
+		unsquashfs_options="${unsquashfs_options} -n"
+	fi
+fi
+
+/usr/bin/echo "#!/bin/bash -e" > "${slurm_script}"
+
+/usr/bin/cat << EOF >> "${slurm_script}"
+
+#SBATCH --job-name=${progname}
+#SBATCH --account=${projectcode}
+#SBATCH --cpus-per-task=${numprocs}
+#SBATCH --time=${timelimit}
+EOF
+
+if [[ -n "${dependency}" ]]
+then
+	/usr/bin/echo "#SBATCH --dependency=afterany:${dependency}" >> "${slurm_script}"
+fi
+
+/usr/bin/cat << EOF >> "${slurm_script}"
+
+verbose="${verbose}"
+debug="${debug}"
+if [[ "\${debug}" == "true" ]]
+then
+	set -x
+fi
+table_of_contents="${table_of_contents}"
+append_to_checksum_file="${append_to_checksum_file}"
+checksum_exe="${checksum_exe}"
+keepfiles="${keepfiles}"
+verify="${verify}"
+nearline_version="${nearline_version}"
+nlput="${nlput}"
+numprocs="${numprocs}"
+extract_path="squashfs-root"
+
+if [[ "\${table_of_contents}" == "true" ]]
+then
+	squashfs_file_index="/nesi/project/${projectcode}/squashfs_files.txt"
+	if [[ -e "\${squashfs_file_index}" && ! -f "\${squashfs_file_index}" ]]
+	then
+		/usr/bin/echo "Error: \${squashfs_file_index}: not a file" >&2
+		exit 2
+	elif [[ -f "\${squashfs_file_index}" && ! -w "\${squashfs_file_index}" ]]
+	then
+		/usr/bin/echo "Error: \${squashfs_file_index}: permission denied" >&2
+		exit 2
+	fi
+
+	/usr/bin/touch "\${squashfs_file_index}" 
+	if [ \$? -ne 0 ]
+	then
+		/usr/bin/echo "Error: Could not create file \${squashfs_file_index}" >&2
+		exit 2
+	fi
+fi
+if [[ ! -e ./checksums.txt ]]
+then
+	/usr/bin/touch checksums.txt
+	if [ \$? -ne 0 ]
+	then
+		/usr/bin/echo "Error: Could not create file checksums.txt" >&2
+		exit 2
+	fi
+fi
+if [[ "\${append_to_checksum_file}" == "true" ]]
+then
+	if [[ ! -f ./checksums.txt ]]
+	then
+		/usr/bin/echo "Error: checksums.txt: not a file" >&2
+		exit 2
+	elif [[ ! -w ./checksums.txt ]]
+	then
+		/usr/bin/echo "Error: checksums.txt: permission denied" >&2
+		exit 2
+	fi
+elif [[ -s ./checksums.txt ]]
+then
+	/usr/bin/echo "Error: checksums.txt: file is not empty" >&2
+	exit 2
+fi
+
+checksums_tempfile="checksums-\$(/usr/bin/uuidgen).txt"
+/usr/bin/touch "\${checksums_tempfile}"
+if [ \$? -ne 0 ]
+then
+	/usr/bin/echo "Error: Could not create file \${checksums_tempfile}" >&2
+	exit 2
+fi
+if [[ -s "./\${checksums_tempfile}" ]]
+then
+	/usr/bin/echo "Error: \${checksums_tempfile}: file is not empty" >&2
+	exit 2
+fi
+if [[ "\${verbose}" == "true" ]]
+then
+	/usr/bin/find ${files_to_squash[@]} -type f -print0 | xargs -0 -I {} \${checksum_exe} {} | /usr/bin/tee "\${checksums_tempfile}"
+else
+	{ /usr/bin/find ${files_to_squash[@]} -type f -print0 | xargs -0 -I {} \${checksum_exe} {} ; } > "\${checksums_tempfile}"
+fi
+/usr/bin/sort -k2,2 \${checksums_tempfile} >> "checksums.txt"
+
+if [[ "\${verbose}" == "true" ]]
+then
+	/usr/bin/rm -v "\${checksums_tempfile}"
+else
+	/usr/bin/rm "\${checksums_tempfile}"
+fi
+
+if [[ -n "\${SLURM_CPUS_PER_TASK}" ]]
+then
+	/usr/sbin/mksquashfs ${files_to_squash[@]} "${dest}" -keep-as-directory -processors \${SLURM_CPUS_PER_TASK} ${mksquashfs_options}
+elif [[ "\${numprocs}" =~ ^[0-9]+\$ ]] && [[ "\${numprocs}" -gt 0 ]]
+then
+	/usr/sbin/mksquashfs ${files_to_squash[@]} "${dest}" -keep-as-directory -processors ${numprocs} ${mksquashfs_options}
+else
+	/usr/sbin/mksquashfs ${files_to_squash[@]} "${dest}" -keep-as-directory ${mksquashfs_options}
+fi
+
+if [[ "\${table_of_contents}" == "true" ]]
+then
+	/usr/bin/date >> "\${squashfs_file_index}"
+	/usr/bin/realpath "${dest}" | \\
+		/usr/bin/sed -e 's:^/scale_wlg_persistent/filesets/home/:/home/:' | \\
+		/usr/bin/sed -e 's:^/scale_wlg_persistent/filesets/project/:/nesi/project/:' | \\
+		/usr/bin/sed -e 's:^/scale_wlg_nobackup/filesets/nobackup/:/nesi/nobackup/:' >> "\${squashfs_file_index}"
+	/usr/sbin/unsquashfs -d "\${extract_path}" -lls "${dest}" | /usr/bin/tail -n +5 >> "\${squashfs_file_index}"
+	/usr/bin/echo "" >> "\${squashfs_file_index}"
+fi
+
+if [[ "\${verify}" == "true" ]]
+then
+	if [[ -e "\${extract_path}" ]]
+	then
+		/usr/bin/echo "Warning: \${extract_path}: file exists" >&2
+		/usr/bin/echo "No verification will be attempted." >&2
+	else
+		intermediate_file_exists=true
+		verification_file_exists=true
+		while [[ "\${intermediate_file_exists}" == "true" ]]
+		do
+			intermediate_file="checksums-extracted-intermediate-\$(/usr/bin/uuidgen).txt"
+			if [[ ! -e "\${intermediate_file}" ]]
+			then
+				intermediate_file_exists=false
+			fi
+		done
+		/usr/bin/touch "\${intermediate_file}"
+		create_intermediate_file=\$?
+		while [[ "\${verification_file_exists}" == "true" ]]
+		do
+			verification_file="checksums-extracted-\$(/usr/bin/uuidgen).txt"
+			if [[ ! -e "\${verification_file}" ]]
+			then
+				verification_file_exists=false
+			fi
+		done
+		/usr/bin/touch "\${verification_file}"
+		create_verification_file=\$?
+		if [ \${create_verification_file} -ne 0 ] || [ \${create_intermediate_file} -ne 0 ]
+		then
+			if [ \${create_verification_file} -ne 0 ]
+			then
+				/usr/bin/echo "Error: Could not create file \${verification_file}" >&2
+			elif [ \${create_intermediate_file} -ne 0 ]
+			then
+				/usr/bin/echo "Error: Could not create file \${intermediate_file}" >&2
+			fi
+			/usr/bin/echo "No verification will be attempted." >&2
+			/usr/bin/rm -f "\${intermediate_file}" "\${verification_file}"
+		else
+			if [[ -n "\${SLURM_CPUS_PER_TASK}" ]]
+			then
+				/usr/sbin/unsquashfs -d "\${extract_path}" -processors \${SLURM_CPUS_PER_TASK} ${unsquashfs_options} "${dest}"
+			elif [[ "\${numprocs}" =~ ^[0-9]+\$ ]] && [[ "\${numprocs}" -gt 0 ]]
+			then
+				/usr/sbin/unsquashfs -d "\${extract_path}" -processors \${numprocs} ${unsquashfs_options} "${dest}"
+			else
+				/usr/sbin/unsquashfs -d "\${extract_path}" ${unsquashfs_options} "${dest}"
+			fi
+			if [[ "\${verbose}" == "true" ]]
+			then
+				/usr/bin/find \${extract_path} -type f -print0 | xargs -0 -I {} \${checksum_exe} {} | tee "\${intermediate_file}"
+			else
+				/usr/bin/find \${extract_path} -type f -print0 | xargs -0 -I {} \${checksum_exe} {} >> "\${intermediate_file}"
+			fi
+			< "\${intermediate_file}" /usr/bin/sed -e "s:\${extract_path}/::" | /usr/bin/sort -k2,2 > "\${verification_file}"
+			/usr/bin/rm "\${intermediate_file}"
+			/usr/bin/diff -sq "checksums.txt" "\${verification_file}"
+			# If diff returns non-zero, either the files differ or something went wrong during execution
+			if [ \$? -eq 0 ]
+			then
+				/usr/bin/rm -r "\${extract_path}"
+				/usr/bin/rm -v "\${verification_file}"
+			else
+				/usr/bin/echo "Error: verification of files in SquashFS archive failed!"
+				exit 2
+			fi
+		fi
+	fi
+fi
+
+# Add the checksums file to the squashfs archive, because why not?
+# There is no need for options here. The same block size and compression algorithm
+# will be used as for the main squash.
+if [[ -n "\${SLURM_CPUS_PER_TASK}" ]]
+then
+	/usr/sbin/mksquashfs checksums.txt "${dest}" -processors \${SLURM_CPUS_PER_TASK}
+elif [[ "\${numprocs}" =~ ^[0-9]+\$ ]] && [[ "\${numprocs}" -gt 0 ]]
+then
+	/usr/sbin/mksquashfs checksums.txt "${dest}" -processors ${numprocs}
+else
+	/usr/sbin/mksquashfs checksums.txt "${dest}"
+fi
+
+# Delete the archived files, unless otherwise requested
+if [[ "\${keepfiles}" == "false" ]]
+then
+	/usr/bin/rm -v ${files_to_squash[@]}
+fi
+if [[ "\${append_to_checksum_file}" == "false" ]]
+then
+	if [[ "\${verbose}" == "true" ]]
+	then
+		/usr/bin/rm -v "checksums.txt"
+	else
+		/usr/bin/rm "checksums.txt"
+	fi
+fi
+
+# Set the group and permissions of the squashfs file
+/usr/bin/chgrp "${projectcode}" "${dest}"
+/usr/bin/chmod ug+rw "${dest}"
+
+if [[ "\${nlput}" == "true" ]]
+then
+	module load nearline/\${nearline_version}
+	cwd=\$(/usr/bin/pwd -L)
+	nlput_filelist="nlput-filelist-\$(/usr/bin/uuidgen).txt"
+	# Paths to individual filelist entries must be absolute and start with
+	# /nesi/project or /nesi/nobackup
+	/usr/bin/echo "\${cwd}/${dest}" > "\${nlput_filelist}"
+	# The path to the filelist itself must be absolute and start with
+	# /nesi/project or /nesi/nobackup
+	/opt/nesi/share/nearline/\${nearline_version}/nlput --nowait "${projectcode}" "\${cwd}/\${nlput_filelist}"
+	/usr/bin/echo ""
+	/usr/bin/echo "Once your upload to nearline completes and you are satisfied that the SquashFS"
+	/usr/bin/echo "archive was copied correctly, you may remove the original SquashFS archive from"
+	/usr/bin/echo "this directory."
+
+	if [[ "\${verbose}" == "true" ]]
+	then
+		/usr/bin/rm -v "\${nlput_filelist}"
+	else
+		/usr/bin/rm "\${nlput_filelist}"
+	fi
+fi
+EOF
+
+if [[ "${interactive}" == "true" ]]
+then
+	/bin/bash "${slurm_script}"
+else
+	/opt/slurm/bin/sbatch "${slurm_script}"
+fi
+
+if [[ -n "${slurm_script}" && -f "${slurm_script}" ]]
+then
+	if [[ "${verbose}" == "true" ]]
+	then
+		/usr/bin/rm -v "${slurm_script}"
+	else
+		/usr/bin/rm "${slurm_script}"
+	fi
+fi

@@ -1,0 +1,4 @@
+#!/bin/bash
+
+squeue_command='squeue -u $(whoami) -t PENDING -o "%14a %.13i %20j %19V %6q %.4D %.4C %.10m %.8Q %19S %r"'
+(eval ${squeue_command} | head -n 1) && (eval ${squeue_command} | tail -n +2 | sort -k10,10 -k9nr,9 -k4,4)

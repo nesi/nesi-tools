@@ -1,0 +1,72 @@
+#!/bin/bash
+
+# Find all those users who are active members of a particular group.
+#
+# Benjamin P. Roberts (2019)
+
+
+function print_usage() {
+	echo "usage: ${progname} <group_name>"
+}
+
+if [ $# -ne 1 ]
+then
+	print_usage
+	exit 1
+fi
+	
+progname=$(basename $0)
+
+group=$1
+
+ipa group-find "${group}"
+
+if [ $? -ne 0 ]
+then
+	echo "Error: Group ${group} not found in FreeIPA!"
+	exit 2
+fi
+
+active_users=()
+inactive_users=()
+
+# Hope like hang that no username contains spaces
+member_list=$(ipa group-show "${group}" | egrep "^ *Member users: " | sed -e 's/^ *Member users: //' | awk -F ', ' 'BEGIN { OFS = " " } { $1 = $1; print }')
+for user in ${member_list}
+do
+	user_details=$(ipa user-show --all "${user}")
+
+	display_name=$(echo "${user_details}" | egrep "^ *Display name: *" | sed -e 's/^ *Display name: *//')
+	user_string="${display_name} (NeSI user ID: ${user})"
+
+	echo "${user_details}" | egrep "^ *Account disabled: True *$" > /dev/null
+	if [ $? -eq 0 ]
+	then
+		user_string="${user_string} (account disabled)"
+		inactive_users=( "${inactive_users[@]}" "${user_string}" )
+		continue
+	fi
+
+	echo "${user_details}" | egrep "^ *Password: False *$" > /dev/null
+	if [ $? -eq 0 ]
+	then
+		user_string="${user_string} (no password set)"
+		inactive_users=( "${inactive_users[@]}" "${user_string}" )
+		continue
+	fi
+	active_users=( "${active_users[@]}" "${user_string}" )
+done
+
+echo "List of active users"
+echo "--------------------"
+for active_user in "${active_users[@]}"
+do
+	echo "${active_user}"
+done
+echo ""
+echo "List of inactive or disabled users"
+echo "----------------------------------"
+for inactive_user in "${inactive_users[@]}"
+do
+	echo "${inactive_user}"
+done

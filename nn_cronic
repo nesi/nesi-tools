@@ -1,0 +1,117 @@
+#!/bin/bash
+
+# Cronic v3 - cron job report wrapper
+# Copyright 2007-2016 Chuck Houpt. No rights reserved, whatsoever.
+# Public Domain CC0: http://creativecommons.org/publicdomain/zero/1.0/
+# Original script accessed from https://habilis.net/cronic/
+# Some modifications made by Ben Roberts, May 2019 to July 2021
+progname=$(basename $0)
+print_usage() {
+	echo "usage: $progname [ -o <output-file> ] [-e <error-file> ] -r <recipient> -- COMMAND [ ARGUMENTS ]"
+}
+
+set -eu
+
+outfile=""
+errfile=""
+RECIPIENT=""
+
+# Execute getopt
+ARGS=$(getopt -o e:ho:r: -l "error-file:,help,output-file:,recipient:" -n "$progname" -- "$@");
+if [ $? -ne 0 ]
+then
+	exit 1
+fi
+ 
+eval set -- "$ARGS"
+ 
+while true
+do
+	case "$1" in
+		-e|--error-file)
+			shift
+			if [ -n "$1" ]; then
+				errfile="$1"
+				shift
+			fi
+			;;
+		-h|--help)
+			print_usage
+			exit 0
+			;;
+		-o|--output-file)
+			shift
+			if [ -n "$1" ]; then
+				outfile="$1"
+				shift
+			fi
+			;;
+		-r|--recipient)
+			shift
+			if [ -n "$1" ]; then
+				RECIPIENT="$1"
+				shift
+			fi
+			;;
+		--)
+			shift
+			break
+			;;
+	esac
+done
+
+if [ -z "$RECIPIENT" ]
+then
+	echo "$progname: error: no recipient specified"
+	echo "$progname: Please specify an email recipient: -r joe.bloggs@example.com"
+	print_usage
+	exit 2
+fi
+
+TMP=$(mktemp -p ~/cron -d)
+if [[ -n "${outfile}" ]]
+then
+	OUT=$TMP/${outfile}
+else
+	OUT=$TMP/cronic.out
+fi
+if [[ -n "${errfile}" ]]
+then
+	ERR=$TMP/${errfile}
+else
+	ERR=$TMP/cronic.err
+fi
+TRACE=$TMP/cronic.trace
+
+set +e
+"$@" >$OUT 2>$TRACE
+RESULT=$?
+set -e
+
+PATTERN="^${PS4:0:1}\\+${PS4:1}"
+if grep -aq "$PATTERN" $TRACE
+then
+	! grep -av "$PATTERN" $TRACE > $ERR
+else
+	mv $TRACE $ERR
+fi
+
+if [ $RESULT -ne 0 -o -s "$ERR" ]
+	then
+	bodytext="$progname detected failure or error output for the command:
+$@
+
+Result code: $RESULT
+Standard output: $OUT
+Standard error: $ERR"
+	mail_args=("-s" "$progname error report" "-a" "$OUT" "-a" "$ERR")
+	if [ -f $TRACE -a -s $TRACE ]
+	then
+		bodytext="$bodytext
+Trace error: $TRACE"
+		mail_args+=("-a" "$TRACE")
+	fi
+	echo "$bodytext" | mail "${mail_args[@]}" "$RECIPIENT"
+fi
+
+rm -rf "$TMP"

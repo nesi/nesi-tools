@@ -1,0 +1,16 @@
+#!/bin/bash
+
+projectcode=$1
+startdate=$2
+enddate=$3
+resource=$4
+
+day=$startdate
+echo "date,resource_use"
+while [ "${day}" != "${enddate}" ]
+do
+	dayplusone=$(date -I -d "${day} + 1 day")
+	resource_use=$(sreport -n cluster AccountUtilizationByUser Start=${day} End=${dayplusone} Account=${projectcode} --tres=${resource} Users="" -t Seconds -p | awk -F'|' '$3 == "" && $4 == ""' | awk -F'|' '{ print $6}')
+	echo "${day},${resource_use}"
+	day=${dayplusone}
+done

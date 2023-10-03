@@ -1,0 +1,152 @@
+#!/usr/bin/python3
+
+# This script is roughtly equivalent to:
+# sacct -P -n -a --format JobID,User,State,Cluster,AllocCPUS,REQMEM,TotalCPU,Elapsed,MaxRSS,NNodes,NTasks -j <job_id>
+
+import sys, getopt, json, subprocess
+
+# Convert elapsed time to string.
+def time2str(seconds):
+    (minutes, seconds) = divmod(int(seconds), 60)
+    (hours, minutes) = divmod(minutes, 60)
+    (days, hours) = divmod(hours, 24)
+    days = '' if days < 1 else f'{days}-'
+    return days + "{:02}:{:02}:{:02}".format(hours, minutes, seconds)
+
+# Convert memory to human-readable string.
+def kbytes2str(kbytes):
+    from math import log
+    if kbytes == 0:
+        return "%.2f %sB" % (0.0, 'M')
+    mul = 1024
+    exp = int(log(kbytes) / log(mul))
+    pre = "kMGTPE "[exp]
+    return "%.2f %sB" % (kbytes / mul**exp, pre.strip())
+
+def sacct(*args):
+    p = subprocess.run(['sacct', '--json'] + list(args),
+            stdout=subprocess.PIPE, timeout=30, check=True)
+    return json.loads(p.stdout)
+
+def ex_tres(objs, name, default=None, field='count'):
+    tres = {m['type']: m[field] for m in objs}
+    if name not in tres and default is not None:
+        return default
+    return tres[name]
+
+(opts, args) = getopt.getopt(sys.argv[1:], 'hvdfj:M:')
+opts = dict(opts)
+
+if 'v' in opts:
+    print("NeSI version of seff")
+    sys.exit(1)
+if 'h' in opts or not (args or '-j' in opts):
+    print("Usage: seff [Options] <JobID>")
+    print("       Options:")
+    print("       -M    Cluster")
+    print("       -h    Help")
+    print("       -j    JobID")
+    print("       -v    Version")
+    sys.exit(1)
+
+if '-M' in opts:
+    clusteropts = ['-M', opts['-M']]
+else:
+    clusteropts = []
+
+if '-j' in opts:
+    job_ids = [opts['-j']]
+else:
+    job_ids = []
+job_ids.extend(args)
+
+sacct_args = clusteropts + ['-j', ','.join(job_ids)]
+
+jobs = sacct(*sacct_args)["jobs"]
+
+if len(jobs) < 1:
+    print("Job not found.", file=sys.stderr)
+    sys.exit(2)
+
+preceded = False
+for job in jobs:
+    if preceded:
+        print()
+    preceded = True
+
+    jobid = job['job_id']
+    user = job['association']['user']
+    state = job['state']['current']
+    ncpus = ex_tres(job['tres']['allocated'], 'cpu', 0)
+
+    if state=="RUNNING" or ncpus == 0 or 'fffffff' in hex(ncpus):
+        print(f"Efficiency not available for {state} jobs.")
+        continue
+    ncores = (ncpus+1) // 2
+
+    clustername = job['cluster']
+    nnodes = job['allocation_nodes']
+
+    reqmem = ex_tres(job['tres']['allocated'], 'mem') * 1024
+    walltime = job['time']['elapsed']
+    timelimit = job['time']['limit']['number'] * 60
+    #exit_status = "{return_code} ({status})".format(**job['exit_code'])
+
+    array_job_id = job['array']['job_id']
+    if array_job_id != 0:
+        array_task_id = job['array']['task_id']['number']
+        array_jobid = f"{array_job_id}_{array_task_id}"
+    else:
+        array_jobid = ""
+
+    tot_cpu_sec = 0
+    tot_cpu_usec = 0
+    mem = -1
+    for step in job['steps']:
+        used = step['tres']['requested']
+        cputime = step['time']['total']
+        tot_cpu_sec += cputime['seconds']
+        tot_cpu_usec += cputime['microseconds']
+        lmem = ex_tres(used['total'], 'mem', 0) / 1024
+        if mem < lmem:
+            (mem, the_step, the_usage) = (lmem, step, used)
+
+    cput = tot_cpu_sec + int((tot_cpu_usec / 1000000) + 0.5)
+    ntasks = the_step['tasks']['count']
+
+    print("Cluster:", clustername)
+    print("Job ID:", jobid)
+    if array_jobid:
+        print("Array Job ID:", array_jobid)
+    print("State:", state)
+    print("Cores:", ncores)
+    print("Tasks:", ntasks)
+    print("Nodes:", nnodes)
+
+    min_mem = ex_tres(the_usage['min'], 'mem', 0) / 1024
+    max_mem = ex_tres(the_usage['max'], 'mem', min_mem) / 1024
+    pernode = ex_tres(the_usage['max'], 'mem', 0, field='task') == -1
+
+    corewalltime = walltime * ncores
+    if corewalltime:
+        cpu_eff = cput / corewalltime * 100
+    else:
+        cpu_eff = 0.0
+
+    print("Job Wall-time:  {: >5.1f}%  {} of {} time limit".format(
+        100*walltime/timelimit, time2str(walltime), time2str(timelimit)))
+    print("CPU Efficiency: {: >5.1f}%  {} of {} core-walltime".format(
+        cpu_eff, time2str(cput), time2str(corewalltime)))
+
+    if reqmem:
+        mem_eff = mem / reqmem * 100
+    else:
+        mem_eff = 0.0
+
+    if ntasks == 1:
+        print("Mem Efficiency: {: >5.1f}%  {} of {}".format(
+            mem_eff, *map(kbytes2str, [mem, reqmem])))
+    else:
+        (denom, desc) = (nnodes, 'node') if pernode else (ntasks, 'task')
+        print("Mem Efficiency: {: >5.1f}%  {} ({} to {} / {desc}) of {} ({}/{desc})".format(
+            mem_eff, *map(kbytes2str, [mem, min_mem, max_mem, reqmem, reqmem / denom]), desc=desc))

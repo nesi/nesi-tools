@@ -1,0 +1,220 @@
+#!/bin/bash
+
+function print_usage_and_exit() {
+	${ECHO} "Usage:"
+	${ECHO} ""
+	${ECHO} "      ${progname} -h"
+	${ECHO} "      ${progname} [-v] -f <acl_file> [--] <file> [ <file> ... ]"
+	${ECHO} ""
+	exit $1
+}
+
+BASENAME=/usr/bin/basename
+DIRNAME=/usr/bin/dirname
+READLINK=/usr/bin/readlink
+
+progname=$(${BASENAME} $0)
+progsource="${BASH_SOURCE[0]}"
+progdir="$(${DIRNAME} "$(${READLINK} -e "${progsource}")")"
+
+source ${progdir}/nn_acl_functions.rc
+
+set_executable_paths
+
+# Execute getopt
+ARGS=$(getopt -o "f:hv" -l "acl-file:,help,verbose" -n "${progname}" -- "$@");
+
+#Bad arguments (error running getopt)
+if [ $? -ne 0 ];
+then
+	${ECHO} "error: ${progname}: bad arguments" 1>&2
+	exit 2
+fi
+
+eval set -- "$ARGS";
+
+verbose=false
+vflag=""
+while true
+do
+	case "$1" in
+		-h|--help)
+			print_usage_and_exit 0
+			;;
+		-f|--acl-file)
+			aclfile=$2
+			shift 2
+			;;
+		-v|--verbose)
+			verbose=true
+			vflag="-v"
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+	esac
+done
+
+if [ $# -eq 0 ]
+then
+	print_usage_and_exit 2
+fi
+
+if [ -z "${aclfile}" ]
+then
+	print_usage_and_exit 2
+elif [ ! -s "${aclfile}" ]
+then
+	${ECHO} "error: empty or nonexistent file: ${aclfile}" 1>&2
+	exit 2
+fi
+
+acl_abspath=$(${READLINK} -f ${aclfile})
+
+terminal_warning
+
+confirm_proposed_acl "add"
+
+if [[ ${EUID} -eq 0 ]]
+then
+	confirm_execution_as_root
+else
+	find_user_string="-and -user $(${WHOAMI})"
+fi
+
+nonexec_files="/tmp/nonexec-$(${UUIDGEN}).txt"
+trap 'errexit $LINENO' ERR
+
+validated_acl_file="/tmp/validated-acl-$(${UUIDGEN}).txt"
+validate_acl_file_for_adding "${aclfile}" "${validated_acl_file}"
+
+for file in "$@"
+do
+	${ECHO} "Processing the contents of ${file} ..."
+	while IFS= read -r -d $'\0' directory_entry
+	do
+		if [ -d "${directory_entry}" ]
+		then
+			if [[ "${verbose}" == "true" ]]
+			then
+				${ECHO} "Saving the default ACL of ${directory_entry}"
+			fi
+			saved_default_acl="/tmp/${progname}-$(${UUIDGEN}).txt"
+			${MMGETACL} -d "${directory_entry}" > "${saved_default_acl}"
+			# If EUID -eq 0, remove the file's default ACL
+			if [[ "${EUID}" -eq 0 ]]
+			then
+				if [[ "${verbose}" == "true" ]]
+				then
+					${ECHO} "Removing the default ACL from ${directory_entry}"
+				fi
+				${MMDELACL} -d "${directory_entry}"
+			fi
+		fi
+		if [[ "${verbose}" == "true" ]]
+		then
+			${ECHO} "Saving the access ACL of ${directory_entry}"
+		fi
+		saved_access_acl="/tmp/${progname}-$(${UUIDGEN}).txt"
+		${MMGETACL} "${directory_entry}" > "${saved_access_acl}"
+		if [[ "${EUID}" -eq 0 ]]
+		then
+			if [[ "${verbose}" == "true" ]]
+			then
+				${ECHO} "Removing the access ACL from ${directory_entry}"
+			fi
+			${MMDELACL} "${directory_entry}"
+		fi
+
+		if [ ! -x "${directory_entry}" ]
+		then
+			if [[ "${verbose}" == "true" ]]
+			then
+				${ECHO} "Writing ${directory_entry} to the list of non-executable files"
+			fi
+			printf "${directory_entry}\0" >> "${nonexec_files}"
+		fi
+
+		if [ -d "${directory_entry}" ]
+		then
+			updated_default_acl="/tmp/${progname}-$(${UUIDGEN}).txt"
+
+			while read -r default_acl_entry
+			do
+				original_default_entry_string=$(${ECHO} "${default_acl_entry}" | ${AWK} 'BEGIN {FS=":";OFS=":"} {print $1,$2}')
+				write_this_line=true
+				while read -r validated_acl_entry
+				do
+					validated_entry_string=$(${ECHO} "${validated_acl_entry}" | ${AWK} 'BEGIN {FS=":";OFS=":"} {print $1,$2}')
+					#${ECHO} "${original_default_entry_string}"
+					#${ECHO} "${validated_entry_string}"
+					if [[ "${original_default_entry_string}" == "${validated_entry_string}" ]]
+					then
+						write_this_line=false
+						break
+					fi
+				done < "${validated_acl_file}"
+				if [[ "${write_this_line}" == "true" ]]
+				then
+					${ECHO} "${default_acl_entry}" >> "${updated_default_acl}"
+				fi
+			done < "${saved_default_acl}"
+			${CAT} "${validated_acl_file}" >> "${updated_default_acl}"
+			if [[ "${verbose}" == "true" ]]
+			then
+				${ECHO} "Updating the default ACL of ${directory_entry}"
+				${ECHO} "Old default ACL:"
+				${CAT} "${saved_default_acl}"
+				${ECHO} "New default ACL:"
+				${CAT} "${updated_default_acl}"
+			fi
+			${MMPUTACL} -d -i "${updated_default_acl}" "${directory_entry}"
+			if [ $? -eq 0 ]
+			then
+				${RM} "${saved_default_acl}"
+				${RM} "${updated_default_acl}"
+			fi
+		fi
+		updated_access_acl="/tmp/${progname}-$(${UUIDGEN}).txt"
+
+		while read -r access_acl_entry
+		do
+			original_access_entry_string=$(${ECHO} "${access_acl_entry}" | ${AWK} 'BEGIN {FS=":";OFS=":"} {print $1,$2}')
+			write_this_line=true
+			while read -r validated_acl_entry
+			do
+				validated_entry_string=$(${ECHO} "${validated_acl_entry}" | ${AWK} 'BEGIN {FS=":";OFS=":"} {print $1,$2}')
+				if [[ "${original_access_entry_string}" == "${validated_entry_string}" ]]
+				then
+					write_this_line=false
+					break
+				fi
+			done < "${validated_acl_file}"
+			if [[ "${write_this_line}" == "true" ]]
+			then
+				${ECHO} "${access_acl_entry}" >> "${updated_access_acl}"
+			fi
+		done < "${saved_access_acl}"
+		${CAT} "${validated_acl_file}" >> "${updated_access_acl}"
+		if [[ "${verbose}" == "true" ]]
+		then
+			${ECHO} "Updating the access ACL of ${directory_entry}"
+			${ECHO} "Old access ACL:"
+			${CAT} "${saved_access_acl}"
+			${ECHO} "New access ACL:"
+			${CAT} "${updated_access_acl}"
+		fi
+		${MMPUTACL} -i "${updated_access_acl}" "${directory_entry}"
+		if [ $? -eq 0 ]
+		then
+			${RM} "${saved_access_acl}"
+			${RM} "${updated_access_acl}"
+		fi
+	done < <({ eval ${FIND} "${file}" -ignore_readdir_race -not -type l ${find_user_string} -print0 ; } || :)
+done
+
+${RM} "${validated_acl_file}"
+remove_inappropriate_execute_permissions
+${ECHO} "Done"

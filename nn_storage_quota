@@ -1,0 +1,139 @@
+#!/bin/bash
+
+#----------------------------------------------------------------------------
+# Description   : Report Spectrum Scale quota 
+#
+#
+# Author        : Fabrice Cantos <fabrice.cantos@niwa.co.nz>
+# Creation date : Sep 6 2018
+# Updated       :
+#               :
+# Dependencies  :
+# System dep.   : scale
+# ui            :
+#----------------------------------------------------------------------------
+
+
+#----------------------------------------------------------------------------
+# Initialisation,  parameters
+#
+CWD=`basename $0`
+HOST_TYPE="`uname -p`-`uname -s`"
+
+if [[ "${0}" == */nn_check_quota ]]
+then
+	echo "The name \"nn_check_quota\" for this script is now deprecated."
+	echo "Please use \"nn_storage_quota\" instead."
+	sleep 3
+fi
+
+# Log & Email parms...
+# LOG_VERBOSITY=0   standart
+# LOG_VERBOSITY=1   send by email info to users
+# LOG_VERBOSITY=2   send by email info to users and admin
+LOG_VERBOSITY=1
+LOG_NAME=""
+#LOG_DIRECTORY="/var/log/"
+#ETO="platform.admin@nesi.org.nz"
+ESubjectError="$(hostname -s) - mmcrsnapshot - FAILURE"
+ESubject="$(hostname -s) - mmcrsnapshot - REPORT"
+
+
+TheHelp ()
+{
+cat << EndOfHelp
+
+        [1m$CWD[0m
+
+[1mSYNOPSIS[0m
+        $CWD [-h] [-p project_id] [-u username]
+
+[1mDESCRIPTION[0m
+        This is a NeSI NIWA custom quota reporting 
+
+[1mEXAMPLES[0m
+        $CWD
+
+
+[1mRETURN[0m
+
+[1mPARAMETERS[0m
+
+        -h --help              This help.
+        
+	-p --project           Not implemented - project to check quota (only for NeSI Admins)
+        
+	-u --user <username>   Username to check quota. Restriction may apply
+
+
+SEE ALSO
+
+EndOfHelp
+
+exit 0
+}
+
+
+
+
+#==============================================================================
+readParameters ()
+{
+    # Variable to fill
+    #-----------------
+    PROJECT_TO_CHECK=""
+
+    # Read parameters
+    #----------------
+    #if [ $# -eq 0 ]; then TheHelp $0; fi
+
+    while [ $# -gt 0 ]
+    do
+        case $1 in
+
+            -u | --user	) shift ; USER_TO_CHECK=$1;;
+
+            -h | --help ) TheHelp $0;;
+
+            -p | --project ) shift ; PROJECT_TO_CHECK=$1;;
+
+            -*) echo "Unknown option [1m$1[0m"
+            exit 1;;
+
+            *) break ;;
+        esac
+        shift
+    done
+
+}
+
+
+#==============================================================================
+main ()
+{
+
+	USER_TO_CHECK=$USER
+
+	readParameters "$@"
+
+    #Project or nobackup to check 
+    if [ "$PROJECT_TO_CHECK" != "" ] && [ -r /scale_wlg_persistent/filesets/opt_nesi/var/quota/users/$USER_TO_CHECK ]; then 
+    
+        cat /scale_wlg_persistent/filesets/opt_nesi/var/quota/project/*_$PROJECT_TO_CHECK
+        cat /scale_wlg_persistent/filesets/opt_nesi/var/quota/nobackup/*_$PROJECT_TO_CHECK
+
+	test -e /scale_wlg_persistent/filesets/opt_nesi/var/quota/nearline/*_$PROJECT_TO_CHECK && cat /scale_wlg_persistent/filesets/opt_nesi/var/quota/nearline/*_$PROJECT_TO_CHECK
+
+    else 
+        # home directory
+	    if [ -r /scale_wlg_persistent/filesets/opt_nesi/var/quota/users/$USER_TO_CHECK ]; then 
+    		
+		    cat /scale_wlg_persistent/filesets/opt_nesi/var/quota/users/$USER_TO_CHECK
+    	fi
+    fi
+
+
+}
+
+main "$@" 
+

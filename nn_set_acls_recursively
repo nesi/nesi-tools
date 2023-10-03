@@ -1,0 +1,114 @@
+#!/bin/bash
+
+function print_usage_and_exit() {
+	${ECHO} "Usage:"
+	${ECHO} ""
+	${ECHO} "      ${progname} -h"
+	${ECHO} "      ${progname} [-v] -f <acl_file> [--] <file> [ <file> ... ]"
+	${ECHO} ""
+	exit $1
+}
+
+BASENAME=/usr/bin/basename
+DIRNAME=/usr/bin/dirname
+READLINK=/usr/bin/readlink
+
+progname=$(${BASENAME} $0)
+progsource="${BASH_SOURCE[0]}"
+progdir="$(${DIRNAME} "$(${READLINK} -e "${progsource}")")"
+
+source ${progdir}/nn_acl_functions.rc
+
+set_executable_paths
+
+# Execute getopt
+ARGS=$(getopt -o "f:hv" -l "acl-file:,help,verbose" -n "${progname}" -- "$@");
+
+#Bad arguments (error running getopt)
+if [ $? -ne 0 ];
+then
+	${ECHO} "error: ${progname}: bad arguments" 1>&2
+	exit 2
+fi
+
+eval set -- "$ARGS";
+
+verbose=false
+vflag=""
+while true
+do
+	case "$1" in
+		-h|--help)
+			print_usage_and_exit 0
+			;;
+		-f|--acl-file)
+			aclfile=$2
+			shift 2
+			;;
+		-v|--verbose)
+			verbose=true
+			vflag="-v"
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+	esac
+done
+
+if [ $# -eq 0 ]
+then
+	print_usage_and_exit 2
+fi
+
+if [ -z "${aclfile}" ]
+then
+	print_usage_and_exit 2
+elif [ ! -s "${aclfile}" ]
+then
+	${ECHO} "error: empty or nonexistent file: ${aclfile}" 1>&2
+	exit 2
+fi
+
+acl_abspath=$(${READLINK} -f ${aclfile})
+
+terminal_warning
+
+confirm_proposed_acl "set"
+
+if [[ ${EUID} -eq 0 ]]
+then
+	confirm_execution_as_root
+else
+	find_user_string="-and -user $(${WHOAMI})"
+fi
+
+nonexec_files="/tmp/nonexec-$(${UUIDGEN}).txt"
+trap 'errexit $LINENO' ERR
+
+for file in "$@"
+do
+	if [[ "${EUID}" -eq 0 ]]
+	then
+		if [ -d "${file}" ] && [ ! -h "${file}" ]
+		then
+			${ECHO} "Removing existing default ACLs from ${file} and any subdirectories..."
+			eval ${FIND} "${file}" -ignore_readdir_race -type d $(find_verbose_or_terse "${MMDELACL} -d")
+		fi
+		${ECHO} "Removing existing access ACLs from ${file} and any contents..."
+		eval ${FIND} "${file}" -ignore_readdir_race -not -type l $(find_verbose_or_terse "${MMDELACL}")
+	fi
+	${ECHO} "Preparing list of non-executable files..."
+	{ eval ${FIND} "${file}" -ignore_readdir_race -not -executable -and -not -type l ${find_user_string} -print0 >> "${nonexec_files}" ; } || :
+	if [ -d "${file}" ] && [ ! -h "${file}" ]
+	then
+		${ECHO} "Recursively applying default ACLs to ${file} and any subdirectories..."
+		{ eval ${FIND} "${file}" -ignore_readdir_race -type d ${find_user_string} $(find_verbose_or_terse "${MMPUTACL} -d -i ${acl_abspath}") ; } || :
+	fi
+	${ECHO} "Recursively applying access ACLs to ${file} and any contents..."
+	{ eval ${FIND} "${file}" -ignore_readdir_race -not -type l ${find_user_string} $(find_verbose_or_terse "${MMPUTACL} -i ${acl_abspath}") ; } || :
+done
+
+remove_inappropriate_execute_permissions
+${ECHO} "Done"

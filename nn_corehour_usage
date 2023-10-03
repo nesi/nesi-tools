@@ -1,0 +1,435 @@
+#!/bin/bash
+
+function print_usage() {
+	echo "Usage: ${progname} [ -c ] [ -n <num_months> ] [ -u <user> ] <project_code> [ <project_code> ... ]"
+}
+
+function error_exit() {
+	echo "$progname: error: $1" >&2
+	print_usage
+	exit 2
+}
+
+progname=$(basename $0)
+
+TZ="NZ"
+DATE=/usr/bin/date
+kupe_epoch="2017-10-18T00:00:00"
+maui_epoch="2018-09-28T00:00:00"
+mahuika_epoch="2018-08-01T00:00:00"
+nummonths=12
+user=$(whoami)
+use_calendar_months=false
+display_ranking=true
+
+# Execute getopt
+ARGS=$(getopt -o cfln:u: -l "calendar-months,fairshare-adj-hours,logical-cpu-hours,number-of-months:,user:" -n "${progname}" -- "$@");
+ 
+#Bad arguments
+if [ $? -ne 0 ]
+then
+	exit 2
+fi
+ 
+eval set -- "$ARGS"
+ 
+while true
+do
+	case "$1" in
+		-c|--calendar-months)
+			shift
+			use_calendar_months=true
+			;;
+		-n|--number-of-months)
+			shift
+			if [ -n "$1" ]
+			then
+				nummonths="${1}"
+				shift
+			fi
+			;;
+		-f|--fairshare-adj-hours|-l|--logical-cpu-hours)
+			echo "The $1 option is no longer necessary and has been deprecated."
+			echo "It will be removed in a future version of $progname."
+			echo "Please update any aliases, functions, scripts, etc. that depend on $progname $1."
+			echo "Continuing anyway..."
+			shift
+			;;
+		-u|--user)
+			shift
+			if [ -n "$1" ]
+			then
+				user="${1}"
+				shift
+			fi
+			;;
+		--)
+			shift
+			break
+			;;
+	esac
+done
+
+if [ $# -lt 1 ]
+then
+	error_exit
+elif ! [[ "${nummonths}" =~ ^[0-9]+$ ]]
+then
+	echo "error: ${progname}: number of months must be a positive integer" >&2
+	error_exit
+elif [[ "${nummonths}" -eq 0 ]]
+then
+	echo "error: ${progname}: number of months must be a positive integer" >&2
+	error_exit
+fi
+
+# Get yesterday's date
+now=$(${DATE} +%Y-%m-%dT%H:00:00)
+dom=$(${DATE} +%d)
+yesterday=$(${DATE} --date="yesterday" +%Y-%m-%dT%H:00:00)
+aweekago=$(${DATE} --date="-1 week" +%Y-%m-%dT%H:00:00)
+
+#TODO: Fix the problem on kupe_mp
+# First awk command removes those clusters that don't have a Slurm controller
+# Second awk command filters the list down to the actual cluster names
+clusters=( $(sacctmgr -n -p list clusters | awk -F '|' '$2 != ""' | awk -F '|' '{print $1}' | grep -v "kupe_mp" ) )
+this_cluster=$(scontrol show config | grep -i ClusterName | awk '{print $3}')
+
+echo ""
+echo "Note: Fair Share rankings will only be shown for the current cluster, ${this_cluster}."
+echo ""
+
+declare -A scores_dict
+
+for i in "${!clusters[@]}"
+do
+	if [[ "${clusters[$i]}" == "${this_cluster}" ]]
+	then
+		fairtree=true
+		# Find out whether we are using Fair Tree here.
+		priority_flags=$(scontrol show config | grep PriorityFlags | awk '{print $3}')
+		if [[ "${priority_flags}" == *"NO_FAIR_TREE"* ]]
+		then
+			fairtree=false
+		fi
+
+		previous_entity=""
+		scores=$(sshare -a -P -n | grep -v "^ *root" | grep -v "^ \+cray" | grep -v "^ \+[A-Za-z]\{1,\}9999[0-9]" | grep -v "^ \+nesi00000")
+		i=0
+		while read -r sl
+		do
+			IFS='|' read -r account user shares score <<<$(echo "${sl}" | awk -F '|' 'BEGIN {OFS = "|" } {print $1, $2, $3, $7}')
+			#account=$(echo ${account} | sed -e 's/^ +//')
+			if [[ "${fairtree}" == "true" ]]
+			then
+				mult_string="an association"
+				if [ -n "${user}" ]
+				then
+					if [[ "${shares}" != 0 && "${shares}" != "parent" ]]
+					then
+						entity="${account}/${user}"
+					else
+						entity="${account}"
+					fi
+				else
+					continue
+				fi
+			else
+				entity="${account}"
+				mult_string="a project"
+				if [[ "${shares}" != "0" && "${shares}" != "parent" ]]
+				then
+					previous_entity="${entity}"
+					continue
+				elif [[ "${entity}" != "${previous_entity}" ]]
+				then
+					continue
+				fi
+			fi
+			if [ -n "${entity}" ]
+			then
+				if [ -n "${scores_dict["${entity}"]}" -a "${scores_dict["${entity}"]}" != "${score}" ]
+				then
+					echo "Warning: Found ${mult_string} on ${this_cluster} with multiple fair share scores: ${entity}" >&2
+					display_ranking=false
+				else
+					scores_dict["${entity}"]="${score}"
+				fi
+			fi
+		done <<< "${scores}"
+		if [[ "${display_ranking}" == "true" ]]
+		then
+			scores_sorted=$(for e in "${!scores_dict[@]}"
+			do
+				echo "$e ${scores_dict[$e]}"
+			done | sort -rn -k2,2)
+		fi
+	fi
+done
+
+for project in "$@"
+do
+	proj_header="Project ${project}"
+	echo "${proj_header}"
+	for i in $(seq 1 ${#proj_header})
+	do
+		printf -- '='
+	done
+	printf '\n'
+
+	for i in "${!clusters[@]}"
+	do
+		cluster_name="${clusters[$i]}"
+		if [[ "${cluster_name}" == "maui" ]]
+		then
+			epoch="${maui_epoch}"
+		elif [[ "${cluster_name}" == "kupe" ]]
+		then
+			epoch="${kupe_epoch}"
+		else
+			epoch="${mahuika_epoch}"
+		fi
+
+		projclust_header="Project ${project} on the ${cluster_name} cluster"
+		printf '\n'
+		echo "${projclust_header}"
+		for j in $(seq 1 ${#projclust_header})
+		do
+			printf -- "-"
+		done
+		printf '\n'
+
+		if [[ "${cluster_name}" == "${this_cluster}" ]]
+		then
+			projscore=""
+			if [ -n "${scores_dict["${project}/${user}"]}" ]
+			then
+				assoc_string="${project}/${user}"
+			else
+				assoc_string="${project}"
+			fi
+			if [[ "${display_ranking}" == "true" ]]
+			then
+				test -n "${scores_dict["${assoc_string}"]}" && projscore=${scores_dict["${assoc_string}"]}
+			fi
+			if [ -n "${projscore}" ]
+			then
+				echo "Fair share score on ${cluster_name}: ${projscore} out of 1.0"
+				if [[ "${display_ranking}" == "true" ]]
+				then
+					projcount=$(echo "${scores_sorted}" | wc -l)
+					better=0
+					while read -r sl
+					do
+						sl1=$(echo "${sl}" | awk '{print $1}')
+						if [[ "${sl1}" == "${assoc_string}" ]]
+						then
+							continue
+						else
+							sl2=$(echo "${sl}" | awk '{print $2}')
+							if (( $(echo "$sl2 > $projscore" | bc -l ) ))
+							then
+								better=$(( ${better} + 1 ))
+							fi
+							rank=$(( ${better} + 1 ))
+						fi
+					done <<< "${scores_sorted}"
+				
+					# Get suffix
+					modulo=$(( ${rank} % 10 ))
+					modulo2=$(( ${rank} % 100 ))
+					if [[ "${modulo}" -eq 1 && "${modulo2}" -ne 11 ]]
+					then
+						suffix="st"
+					elif [[ "${modulo}" -eq 2 && "${modulo2}" -ne 12 ]]
+					then
+						suffix="nd"
+					elif [[ "${modulo}" -eq 3 && "${modulo2}" -ne 13 ]]
+					then
+						suffix="rd"
+					else
+						suffix="th"
+					fi
+					# Get percentile
+					percentile=$(echo "100 * ${better} / ${projcount}" | bc -l)
+					if [[ "${fairtree}" == "false" ]]
+					then
+						estring="projects"
+					else
+						estring="associations"
+					fi
+					printf "Ranked %d%s of %d active %s (behind %.2f%% of active %s)\n" "${rank}" "${suffix}" "${projcount}" "${estring}" "${percentile}" "${estring}"
+				else
+					echo "Could not rank projects by Fair Share score. See above for details."
+				fi
+				echo ""
+			else
+				printf '\n'
+				echo "Note: Project ${project} has no current allocation on ${cluster_name}."
+				echo "      Therefore, it has no fair share score or ranking there either."
+				printf '\n'
+			fi
+		fi
+
+		cpu_divisor=2
+		mem_divisor=1024
+		if [[ "${cluster_name}" == "maui" ]]
+		then
+			sreport_type="cpu,mem"
+		elif [[ "${cluster_name}" == "maui_ancil" ]]
+		then
+			sreport_type="cpu,gres/gpu,mem"
+		elif [[ "${cluster_name}" == "mahuika" ]]
+		then
+			sreport_type="cpu,gres/gpu:p100,gres/gpu:a100,mem"
+		fi
+		sreport_args=("-M" "${cluster_name}" "-P" "cluster" "AccountUtilizationByUser" "-T" "${sreport_type}" "-t" "Hours" "End=${now}" "Account=${project}")
+		awk_args_cpu=("-F" "|" "{ if (\$5 == \"cpu\" && \$3 == \"\") { printf(\"%.0f\",(0.00005+\$6/${cpu_divisor})) } }")
+		awk_args_gpu=("-F" "|" "{ if (\$5 == \"gres/gpu\" && \$3 == \"\") { printf(\"%.0f\",(0.00005+\$6)) } }")
+		awk_args_p100=("-F" "|" "{ if (\$5 == \"gres/gpu:p100\" && \$3 == \"\") { printf(\"%.0f\",(0.00005+\$6)) } }")
+		awk_args_a100=("-F" "|" "{ if (\$5 == \"gres/gpu:a100\" && \$3 == \"\") { printf(\"%.0f\",(0.00005+\$6)) } }")
+		awk_args_mem=("-F" "|" "{ if (\$5 == \"mem\" && \$3 == \"\") { printf(\"%.0f\",(0.00005+\$6/${mem_divisor})) } }")
+		awk_args_billing_mahuika=("{ printf(\"%.0f\",((0.7 * \$1) + (7.0 * \$2) + (18.0 * \$3) + (0.1 * \$4))) }")
+		awk_args_billing_maui=("{ printf(\"%.0f\",(0.025 * \$1)) }")
+
+		earliest_period_start="${now}"
+		# Get usage in the last day and in the last week
+		lastday_cpu=$(sreport "${sreport_args[@]}" Start=${yesterday} | awk "${awk_args_cpu[@]}" )
+		lastday_mem=$(sreport "${sreport_args[@]}" Start=${yesterday} | awk "${awk_args_mem[@]}" )
+		if [[ "${cluster_name}" == "mahuika" ]]
+		then
+			lastday_p100=$(sreport "${sreport_args[@]}" Start=${yesterday} | awk "${awk_args_p100[@]}" )
+			lastday_a100=$(sreport "${sreport_args[@]}" Start=${yesterday} | awk "${awk_args_a100[@]}" )
+			printf "%-42s %14s %21s %21s %15s %13s\n" "Usage period" "CPU core hours" "P100 GPU device hours" "A100 GPU device hours" "GB-hours of RAM" "Compute units"
+			printf "%-42s %14s %21s %21s %15s %13s\n" "------------" "--------------" "---------------------" "---------------------" "---------------" "-------------"
+			lastday_billing=$(echo "${lastday_cpu}" "${lastday_p100}" "${lastday_a100}" "${lastday_mem}" | awk "${awk_args_billing_mahuika[@]}")
+			printf "%-19s to %19s %'14d %'21d %'21d %'15d %'13d\n" ${yesterday} ${now} ${lastday_cpu} ${lastday_p100} ${lastday_a100} ${lastday_mem} ${lastday_billing}
+		elif [[ "${cluster_name}" == "maui_ancil" ]]
+		then
+			lastday_gpu=$(sreport "${sreport_args[@]}" Start=${yesterday} | awk "${awk_args_gpu[@]}" )
+			printf "%-42s %14s %16s %15s\n" "Usage period" "CPU core hours" "GPU device hours" "GB-hours of RAM"
+			printf "%-42s %14s %16s %15s\n" "------------" "--------------" "----------------" "---------------"
+			printf "%-19s to %19s %'14d %'16d %'15d\n" ${yesterday} ${now} ${lastday_cpu} ${lastday_gpu} ${lastday_mem}
+		elif [[ "${cluster_name}" == "maui" ]]
+		then
+			lastday_node=$(echo "${lastday_cpu}" | awk "${awk_args_billing_maui[@]}")
+			printf "%-42s %14s %15s %10s\n" "Usage period" "CPU core hours" "GB-hours of RAM" "Node hours"
+			printf "%-42s %14s %15s %10s\n" "------------" "--------------" "---------------" "----------"
+			printf "%-19s to %19s %'14d %'15d %'10d\n" ${yesterday} ${now} ${lastday_cpu} ${lastday_mem} ${lastday_node}
+		fi
+
+		lastweek_cpu=$(sreport "${sreport_args[@]}" Start=${aweekago} | awk "${awk_args_cpu[@]}" )
+		lastweek_mem=$(sreport "${sreport_args[@]}" Start=${aweekago} | awk "${awk_args_mem[@]}" )
+		if [[ "${cluster_name}" == "mahuika" ]]
+		then
+			lastweek_p100=$(sreport "${sreport_args[@]}" Start=${aweekago} | awk "${awk_args_p100[@]}" )
+			lastweek_a100=$(sreport "${sreport_args[@]}" Start=${aweekago} | awk "${awk_args_a100[@]}" )
+			lastweek_billing=$(echo "${lastweek_cpu}" "${lastweek_p100}" "${lastweek_a100}" "${lastweek_mem}" | awk "${awk_args_billing_mahuika[@]}")
+			printf "%-19s to %19s %'14d %'21d %'21d %'15d %'13d\n" ${aweekago} ${now} ${lastweek_cpu} ${lastweek_p100} ${lastweek_a100} ${lastweek_mem} ${lastweek_billing}
+		elif [[ "${cluster_name}" == "maui_ancil" ]]
+		then
+			lastweek_gpu=$(sreport "${sreport_args[@]}" Start=${aweekago} | awk "${awk_args_gpu[@]}" )
+			printf "%-19s to %19s %'14d %'16d %'15d\n" ${aweekago} ${now} ${lastweek_cpu} ${lastweek_gpu} ${lastweek_mem}
+		elif [[ "${cluster_name}" == "maui" ]]
+		then
+			lastweek_node=$(echo "${lastweek_cpu}" | awk "${awk_args_billing_maui[@]}")
+			printf "%-19s to %19s %'14d %'15d %'10d\n" ${aweekago} ${now} ${lastweek_cpu} ${lastweek_mem} ${lastweek_node}
+		fi
+		printf "\n"
+
+		# Get usage between the beginning of the month and now,
+		# but only if we have asked for calendar month reporting
+		if [[ "${use_calendar_months}" == true ]]
+		then
+			period_start=$(${DATE} +%Y-%m-01T00:00:00)
+			period_cpu=$(sreport "${sreport_args[@]}" Start=${period_start} | awk "${awk_args_cpu[@]}" )
+			period_mem=$(sreport "${sreport_args[@]}" Start=${period_start} | awk "${awk_args_mem[@]}" )
+			if [[ "${cluster_name}" == "mahuika" ]]
+			then
+				period_p100=$(sreport "${sreport_args[@]}" Start=${period_start} | awk "${awk_args_p100[@]}" )
+				period_a100=$(sreport "${sreport_args[@]}" Start=${period_start} | awk "${awk_args_a100[@]}" )
+				period_billing=$(echo "${period_cpu}" "${period_p100}" "${period_a100}" "${period_mem}" | awk "${awk_args_billing_mahuika[@]}")
+				printf "%-19s to %19s %'14d %'21d %'21d %'15d %'13d\n" ${period_start} ${now} ${period_cpu} ${period_p100} ${period_a100} ${period_mem} ${period_billing}
+			elif [[ "${cluster_name}" == "maui_ancil" ]]
+			then
+				period_gpu=$(sreport "${sreport_args[@]}" Start=${period_start} | awk "${awk_args_gpu[@]}" )
+				printf "%-19s to %19s %'14d %'16d %'15d\n" ${period_start} ${now} ${period_cpu} ${period_gpu} ${period_mem}
+			elif [[ "${cluster_name}" == "maui" ]]
+			then
+				period_node=$(echo "${period_cpu}" | awk "${awk_args_billing_maui[@]}")
+				printf "%-19s to %19s %'14d %'15d %'10d\n" ${period_start} ${now} ${period_cpu} ${period_mem} ${period_node}
+			fi
+		fi
+
+		for i in $(seq 1 1 ${nummonths})
+		do
+			if [[ "${use_calendar_months}" == false ]]
+			then
+				period_end=$(${DATE} --date="-$((${i} - 1)) month" +%Y-%m-%dT%H:00:00)
+			else
+				# Deal with unexpected handling of month subtraction at the end of any month
+				# save February
+				period_end=$(${DATE} --date="$(${DATE} +%Y-%m-15) -$((${i} - 1)) month" +%Y-%m-01T00:00:00)
+			fi
+			if ! [[ "${period_end}" > "${epoch}" ]]
+			then
+				continue
+			fi
+
+			if [[ "${use_calendar_months}" == false ]]
+			then
+				period_start=$(${DATE} --date="-${i} month" +%Y-%m-%dT%H:00:00)
+			else
+				# Deal with unexpected handling of month subtraction at the end of any month
+				# save February
+				period_start=$(${DATE} --date="$(${DATE} +%Y-%m-15) -${i} month" +%Y-%m-01T00:00:00)
+			fi
+			if [[ "${period_start}" < "${epoch}" ]]
+			then
+				period_start="${epoch}"
+			fi
+			earliest_period_start="${period_start}"
+			period_cpu=$(sreport "${sreport_args[@]}" Start=${period_start} End=${period_end} | awk "${awk_args_cpu[@]}" )
+			period_mem=$(sreport "${sreport_args[@]}" Start=${period_start} End=${period_end} | awk "${awk_args_mem[@]}" )
+			if [[ "${cluster_name}" == "mahuika" ]]
+			then
+				period_p100=$(sreport "${sreport_args[@]}" Start=${period_start} End=${period_end} | awk "${awk_args_p100[@]}" )
+				period_a100=$(sreport "${sreport_args[@]}" Start=${period_start} End=${period_end} | awk "${awk_args_a100[@]}" )
+				period_billing=$(echo "${period_cpu}" "${period_p100}" "${period_a100}" "${period_mem}" | awk "${awk_args_billing_mahuika[@]}")
+				printf "%-19s to %19s %'14d %'21d %'21d %'15d %'13d\n" ${period_start} ${period_end} ${period_cpu} ${period_p100} ${period_a100} ${period_mem} ${period_billing}
+			elif [[ "${cluster_name}" == "maui_ancil" ]]
+			then
+				period_gpu=$(sreport "${sreport_args[@]}" Start=${period_start} End=${period_end} | awk "${awk_args_gpu[@]}" )
+				printf "%-19s to %19s %'14d %'16d %'15d\n" ${period_start} ${period_end} ${period_cpu} ${period_gpu} ${period_mem}
+			elif [[ "${cluster_name}" == "maui" ]]
+			then
+				period_node=$(echo "${period_cpu}" | awk "${awk_args_billing_maui[@]}")
+				printf "%-19s to %19s %'14d %'15d %'10d\n" ${period_start} ${period_end} ${period_cpu} ${period_mem} ${period_node}
+			fi
+		done
+
+		# Get the earliest start and sum up all usage to now
+		# (has to wait until after the loop is finished to get the correct value of period_start)
+		if [[ "${nummonths}" -gt 1 ]] || [[ "${use_calendar_months}" == true && "${dom}" -gt 7 ]]
+		then
+			printf "\n"
+			period_cpu=$(sreport "${sreport_args[@]}" Start=${earliest_period_start} End=${now} | awk "${awk_args_cpu[@]}" )
+			period_mem=$(sreport "${sreport_args[@]}" Start=${earliest_period_start} End=${now} | awk "${awk_args_mem[@]}" )
+			if [[ "${cluster_name}" == "mahuika" ]]
+			then
+				period_p100=$(sreport "${sreport_args[@]}" Start=${earliest_period_start} End=${now} | awk "${awk_args_p100[@]}" )
+				period_a100=$(sreport "${sreport_args[@]}" Start=${earliest_period_start} End=${now} | awk "${awk_args_a100[@]}" )
+				period_billing=$(echo "${period_cpu}" "${period_p100}" "${period_a100}" "${period_mem}" | awk "${awk_args_billing_mahuika[@]}")
+				printf "%-19s to %19s %'14d %'21d %'21d %'15d %'13d\n" ${earliest_period_start} ${now} ${period_cpu} ${period_p100} ${period_a100} ${period_mem} ${period_billing}
+			elif [[ "${cluster_name}" == "maui_ancil" ]]
+			then
+				period_gpu=$(sreport "${sreport_args[@]}" Start=${earliest_period_start} End=${now} | awk "${awk_args_gpu[@]}" )
+				printf "%-19s to %19s %'14d %'16d %'15d\n" ${earliest_period_start} ${now} ${period_cpu} ${period_gpu} ${period_mem}
+			elif [[ "${cluster_name}" == "maui" ]]
+			then
+				period_node=$(echo "${period_cpu}" | awk "${awk_args_billing_maui[@]}")
+				printf "%-19s to %19s %'14d %'15d %'10d\n" ${earliest_period_start} ${now} ${period_cpu} ${period_mem} ${period_node}
+			fi
+		fi
+	done
+done

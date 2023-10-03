@@ -1,0 +1,113 @@
+#!/usr/bin/env python
+
+import gzip, os, os.path, sys
+import grp
+import re
+import pwd
+from collections import defaultdict, Counter
+import argparse
+
+POLICY = os.path.join('.policy', 'to_delete', 'latest.filelist.gz')
+
+class Directory(object):
+    def __init__(self, paths):
+        self.paths = paths
+        self.count = len(paths)
+        self.children = Counter(path.split(os.sep, 1)[0] for path in self.paths)
+        self.expanded = False
+
+    def expand(self):
+        if self.expanded: return
+        self.files = [p for p in self.paths if os.sep not in p]
+        subdirectories = defaultdict(list)
+        for path in self.paths:
+            if os.sep in path:
+                (child, path) = path.split(os.sep, 1)
+                subdirectories[child].append(path)
+        self.subdirectories = {}
+        for (child, paths) in subdirectories.items():
+            self.subdirectories[child] = Directory(paths)
+        self.expanded = True
+        del self.paths
+
+    def report(self, dir, indent='  ', prefix=''):
+        if self.expanded:
+            lines = [str(prefix)+str(dir)+str(os.sep)]
+            prefix += indent
+            lines.extend(str(prefix)+str(f) for f in sorted(self.files))
+            for (name, c) in sorted(self.subdirectories.items()):
+                lines.extend(c.report(name, indent, prefix))
+        elif len(self.paths) == 1:
+            path = self.paths[0]
+            lines = [str(prefix)+str(dir)+str(os.sep)+str(path)]
+        else:
+            while len(self.children) == 1:
+                child = set(self.children).pop()
+                dir = os.path.join(dir, child)
+                self = Directory([p.split(os.sep, 1)[1] for p in self.paths])
+            squashed = str(self.count)+' files'
+            lines = [str(prefix)+str(dir)+str(os.sep)+" - "+str(squashed)]
+        return lines
+
+def my_groups(user=None):
+    lst=[grp.getgrgid(g).gr_name for g in os.getgroups()]
+    if not user is None:
+        lst.remove(user)
+    r=re.compile("^[a-zA-Z]+[0-9]+$")
+    return list(filter(r.match,lst))
+
+
+parser = argparse.ArgumentParser(description='Processing to_delete files')
+parser.add_argument('--project', '-p', nargs='?', dest='Projects', help='Comma-separated list of projects to process. If not given, process all projects of which the user is a member')
+parser.add_argument('--unlimited','-u', dest='Unlimited', action='store_true', help='Do not limit the length of the output file')
+parser.add_argument('--limit', '-l', type=int, default=40, dest='LengthLimit', help='Maximum length of the output file (lines)')
+#parser.add_argument('--useronly','-o', dest='UserOnly', action='store_true', help='Check project directories only for the current user')
+
+args = parser.parse_args()
+limit = args.LengthLimit
+if args.Unlimited:
+    limit=None
+
+user=pwd.getpwuid( os.getuid() )[ 0 ]
+
+
+if args.Projects is None:
+    projects=my_groups(user)
+else:
+    projects=[item for item in args.Projects.split(',')]
+
+for p in projects:
+    dir= os.path.join(os.sep, 'nesi', 'nobackup', p)
+#    if args.UserOnly:
+#        dir+= "/" + user
+    s = len(dir)+1
+    base = dir
+    while base:
+        policy_fn = os.path.join(base, POLICY)
+        if os.path.exists(policy_fn):
+            to_delete = set(l.strip()[s:] for l in gzip.open(policy_fn, mode='rt') if l.startswith(dir))
+            break
+        (base, suffix) = base.rsplit(os.sep, 1)
+    else:
+        #raise RuntimeError("No policy file found")
+        continue
+
+    top = Directory(to_delete)
+    fringe = {len(top.children): [(dir, top)]}
+    length = 1
+    while fringe:
+        next = defaultdict(list)
+        for (new_lines, nodes) in sorted(fringe.items()):
+            if not limit is None and length + (new_lines * len(nodes)) > limit:
+                break
+            for (name, d) in nodes:
+                length += new_lines
+                d.expand()
+                #print(new_lines, 'lines from', name, 'total', length)
+                for (name2, c) in d.subdirectories.items():
+                    next[len(c.children)].append((os.path.join(name, name2), c))
+        fringe = next
+
+    for line in top.report(dir):
+        print(line)
+    print("-----------------------------------------------------")

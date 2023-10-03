@@ -1,0 +1,136 @@
+#!/bin/bash -e
+
+progname=$(/usr/bin/basename $0)
+
+MMFS_EXE_DIR="/usr/lpp/mmfs/bin"
+AUTOCLEANER_DIR="/opt/nesi/sbin/gpfsautocleaner.prod"
+AUTOCLEANER_SCAN_FILE="${AUTOCLEANER_DIR}/projects.scan.exclude.list"
+AUTOCLEANER_DELETE_FILE="${AUTOCLEANER_DIR}/projects.delete.exclude.list"
+MMLSFS="${MMFS_EXE_DIR}/mmlsfs"
+MMLSQUOTA="${MMFS_EXE_DIR}/mmlsquota"
+
+AWK="/usr/bin/awk"
+ECHO="/usr/bin/echo"
+GREP="/usr/bin/grep"
+IPA="/usr/bin/ipa"
+MKDIR="/usr/bin/mkdir"
+SED="/usr/bin/sed"
+TAIL="/usr/bin/tail"
+UUIDGEN="/usr/bin/uuidgen"
+WHOAMI="/usr/bin/whoami"
+
+if [ $# -ne 1 ]
+then
+	${ECHO} "usage: ${progname} <username>" >&2
+	${ECHO} "       ${progname} <project_code>" >&2
+	exit 2
+fi
+
+function get_subblock_size() {
+
+	file=$1
+
+	local block_size=$(${TAIL} -n +3 ${file} | ${GREP} -E "^ -B" | ${AWK} '{print $2}')
+	local subblocks_per_block=$(${TAIL} -n +3 ${file} | ${GREP} -E "^ --subblocks-per-full-block" | ${AWK} '{print $2}')
+	local subblock_size=$((${block_size}/${subblocks_per_block}))
+
+	kilo=1024
+	mega=$((${kilo} * 1024))
+	giga=$((${mega} * 1024))
+	tera=$((${giga} * 1024))
+
+	if ! ((${subblock_size} % ${tera}))
+	then
+		subblock_size="$((${subblock_size} / ${tera} ))T"
+	elif ! ((${subblock_size} % ${giga}))
+	then
+		subblock_size="$((${subblock_size} / ${giga} ))G"
+	elif ! ((${subblock_size} % ${mega}))
+	then
+		subblock_size="$((${subblock_size} / ${mega} ))M"
+	else
+		subblock_size="$((${subblock_size} / ${kilo} ))K"
+	fi
+	${ECHO} "${subblock_size}"
+}
+
+# Necessary to use only standard libraries
+# (the XZ library loaded by some modules breaks ipa)
+unset LD_LIBRARY_PATH
+
+is_user=false
+is_group=false
+
+${IPA} user-show "${1}" > /dev/null 2>/dev/null && is_user=true || is_user=false
+${IPA} group-show "${1}" > /dev/null 2>/dev/null && is_group=true || is_group=false
+
+if [[ "${is_user}" != "true" && "${is_group}" != "true" ]]
+then
+	${ECHO} "Error: ${1} is not a recognised user or group"
+	exit 2
+fi
+
+${MKDIR} -p "/tmp/$(${WHOAMI})"
+
+fs_persistent="scale_wlg_persistent"
+fs_persistent_info_file="/tmp/$(${WHOAMI})/${progname}-$(${UUIDGEN}).txt"
+
+fs_nobackup="scale_wlg_nobackup"
+fs_nobackup_info_file="/tmp/$(${WHOAMI})/${progname}-$(${UUIDGEN}).txt"
+
+${MMLSFS} "${fs_persistent}" --subblocks-per-full-block -B > "${fs_persistent_info_file}"
+fs_persistent_subblock_size=$(get_subblock_size "${fs_persistent_info_file}")
+${MMLSFS} "${fs_nobackup}" --subblocks-per-full-block -B > "${fs_nobackup_info_file}"
+fs_nobackup_subblock_size=$(get_subblock_size "${fs_nobackup_info_file}")
+
+if [[ "${fs_persistent_subblock_size}" != "${fs_nobackup_subblock_size}" ]]
+then
+	${ECHO} "Error: Sub-block sizes on persistent and nobackup filesystems differ!" >&2
+	${ECHO} "Persistent filesystem sub-block size: ${fs_persistent_subblock_size}" >&2
+	${ECHO} "Nobackup filesystem sub-block size: ${fs_nobackup_subblock_size}" >&2
+fi
+
+if [[ "${is_user}" == "true" ]]
+then
+	${MMLSQUOTA} --block-size "${fs_persistent_subblock_size}" -j "home_${1}" "${fs_persistent}" | ${SED} 's/^Filesystem type/Filesystem     /' | ${SED} -r "s/${fs_persistent} FILESET/persistent        /"
+else
+	${MMLSQUOTA} --block-size "${fs_persistent_subblock_size}" -j "project_${1}" "${fs_persistent}" | ${SED} 's/^Filesystem type/Filesystem     /' | ${SED} -r "s/${fs_persistent} FILESET/persistent        /"
+	${MMLSQUOTA} --block-size "${fs_nobackup_subblock_size}" -j "nobackup_${1}" "${fs_nobackup}" | ${TAIL} -n +3 | ${SED} 's/^Filesystem type/Filesystem     /' | ${SED} -r "s/${fs_nobackup} FILESET/nobackup          /"
+
+	${ECHO} ""
+	set +e
+	${GREP} "${1}" "${AUTOCLEANER_SCAN_FILE}" > /dev/null
+	scan_status=$?
+	${GREP} "${1}" "${AUTOCLEANER_DELETE_FILE}" > /dev/null
+	delete_status=$?
+	set -e
+	if [[ "${scan_status}" -eq 0 ]]
+	then
+		${ECHO} "Project ${1} is exempted from scanning for automatic nobackup cleanup"
+		${ECHO} "Project ${1} is implicitly exempted from deletion for automatic nobackup cleanup"
+	else
+		if [[ "${scan_status}" -eq 1 ]]
+		then
+			${ECHO} "Project ${1} is enrolled in scanning for automatic nobackup cleanup"
+			if [[ "${delete_status}" -eq 0 ]]
+			then
+				${ECHO} "Project ${1} is exempted from deletion for automatic nobackup cleanup"
+			elif [[ "${delete_status}" -eq 1 ]]
+			then
+				${ECHO} "Project ${1} is enrolled in deletion for automatic nobackup cleanup"
+			fi
+		else
+			${ECHO} "An error occurred while checking the contents of ${AUTOCLEANER_SCAN_FILE}!"
+			${ECHO} "Could not ascertain whether or not project ${1} is exempted from scanning for automatic nobackup cleanup."
+		fi
+		if [[ "${delete_status}" -gt 1 ]]
+		then
+			${ECHO} "An error occurred while checking the contents of ${AUTOCLEANER_DELETE_FILE}!"
+			${ECHO} "Could not ascertain whether or not project ${1} is exempted from deletion for automatic nobackup cleanup."
+		fi
+	fi
+fi
+
+set +e
+rm "${fs_persistent_info_file}"
+rm "${fs_nobackup_info_file}"

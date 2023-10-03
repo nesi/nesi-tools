@@ -1,0 +1,68 @@
+#!/bin/bash
+
+ECHO=/usr/bin/echo
+EXPR=/usr/bin/expr
+LS=/usr/bin/ls
+MMGETACL=/usr/lpp/mmfs/bin/mmgetacl
+PRINTF=/usr/bin/printf
+REALPATH=/usr/bin/realpath
+SEQ=/usr/bin/seq
+
+exitcode=0
+
+for projectcode in "$@"
+do
+	if [[ -z "${projectcode}" ]]
+	then
+		${ECHO} "Warning: The supplied list of project codes includes the empty string!"
+		${ECHO} "This code will be skipped."
+		if [[ "${exitcode}" -lt 1 ]]
+		then
+			exitcode=1
+		fi
+		continue
+	fi
+
+	string="Project ${projectcode}"
+	${ECHO} "${string}"
+	${PRINTF} -- "=%.0s" $(${SEQ} 1 $(${EXPR} length "${string}")) && ${PRINTF} "\n"
+	${ECHO} ""
+	${ECHO} "Project directory present?"
+	${ECHO} "--------------------------"
+	${LS} -ld "/nesi/project/${projectcode}"
+	${LS} -ld $(${REALPATH} "/nesi/project/${projectcode}")
+	${ECHO} ""
+	${ECHO} "Nobackup directory present?"
+	${ECHO} "---------------------------"
+	${LS} -ld "/nesi/nobackup/${projectcode}"
+	${LS} -ld $(${REALPATH} "/nesi/nobackup/${projectcode}")
+	${ECHO} ""
+	${ECHO} "Snapshot directory present?"
+	${ECHO} "---------------------------"
+	${LS} -ld "/nesi/project/${projectcode}/.snapshots"
+	${ECHO} ""
+	${ECHO} "Autocleaner README present?"
+	${ECHO} "---------------------------"
+	${LS} -l "/nesi/nobackup/${projectcode}/AUTOCLEANER_README.txt"
+	${ECHO} ""
+	${ECHO} "Project disk space and inode allocations"
+	${ECHO} "----------------------------------------"
+	/opt/nesi/bin/diskquotas "${projectcode}"
+	${ECHO} ""
+	${ECHO} "Project directory ACL"
+	${ECHO} "---------------------"
+	${MMGETACL}    "/nesi/project/${projectcode}"
+	${ECHO} ""
+	${ECHO} "Project directory default ACL"
+	${ECHO} "-----------------------------"
+	${MMGETACL} -d "/nesi/project/${projectcode}"
+	${ECHO} ""
+	${ECHO} "Nobackup directory ACL"
+	${ECHO} "----------------------"
+	${MMGETACL}    "/nesi/nobackup/${projectcode}"
+	${ECHO} ""
+	${ECHO} "Nobackup directory default ACL"
+	${ECHO} "------------------------------"
+	${MMGETACL} -d "/nesi/nobackup/${projectcode}"
+done
+exit ${exitcode}

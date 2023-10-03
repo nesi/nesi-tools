@@ -1,0 +1,281 @@
+#!/usr/bin/env python2
+
+import sys
+import os
+from subprocess import Popen, PIPE
+from operator import itemgetter, attrgetter
+import argparse
+
+def compare_sshare_entries(p, q):
+
+    ''' Sort preprocessed sshare list entries '''
+
+    global maxDepth
+
+    # This gets every even number up to 2*maxDepth, but
+    # not including 2*(maxDepth + 1).
+    # Even numbers (i) (0, 2, 4, ...) are branch/leaf names.
+    # Odd numbers (i+1) (1, 3, 5, ...) are branch/leaf Fair Share scores.
+    for i in range(0,2*(maxDepth+1),2):
+        # Sort so that the branch at this level with the highest Fair Share
+        # score comes first.
+        if p[i+1] > q[i+1]:
+            return -1
+        elif p[i+1] < q[i+1]:
+            return 1
+        # Consider names of branches, but not of leaves.
+        elif i != 2*maxDepth:
+            # ...sort so that if two branches have the same Fair Share scores
+            # but different names, the branch with the lexically greater name
+            # comes last.
+            if p[i] > q[i]:
+                return 1
+            if p[i] < q[i]:
+                return -1
+
+    # If the Fair Share scores of the two leaves are equal, then...
+    if p[2*maxDepth + 1] == q[2*maxDepth + 1]:
+        # ...put the leaf with the highest number of RawShares first...
+        if p[2*maxDepth + 4] > q[2*maxDepth + 4]:
+            return -1
+        elif p[2*maxDepth + 4] < q[2*maxDepth + 4]:
+            return 1
+        # ...and if both leaves have the same number of RawShares, and one has
+        # raw usage but the other does not, and the Fair Share scores are zero,
+        # put the one with no raw usage last...
+        elif p[2*maxDepth + 1] == 0.0:
+            if p[2*maxDepth + 6] == 0 and q[2*maxDepth + 6] > 0:
+                return 1
+            elif p[2*maxDepth + 6] > 0 and q[2*maxDepth + 6] == 0:
+                return -1
+        # ...and if both leaves have RawShares and both have some or no raw
+        # usage, put the leaf with the highest amount of effective usage last...
+        elif p[2*maxDepth + 7] > q[2*maxDepth + 7]:
+            return 1
+        elif p[2*maxDepth + 7] < q[2*maxDepth + 7]:
+            return -1
+        # ...and if both leaves have RawShares, and both have some or no raw
+        # usage, and both have the same amount of effective usage, put the
+        # one with the highest raw usage last.
+        elif p[2*maxDepth + 6] > q[2*maxDepth + 6]:
+            return 1
+        elif p[2*maxDepth + 6] < q[2*maxDepth + 6]:
+            return -1
+        # Finally, if they aren't otherwise distinguishable, put the lexically
+        # greatest project code last.
+        elif p[2*maxDepth] > q[2*maxDepth]:
+            return 1
+        elif p[2*maxDepth] < q[2*maxDepth]:
+            return -1
+
+    return 0
+
+def compare_sshare_entries_ft(p, q):
+
+    ''' Sort preprocessed sshare list entries '''
+
+    global maxDepth
+
+    # This gets every even number up to 2*maxDepth, but
+    # not including 2*(maxDepth + 1).
+    # Even numbers (i) (0, 2, 4, ...) are branch/leaf names.
+    # Odd numbers (i+1) (1, 3, 5, ...) are branch/leaf Fair Share scores.
+    #for i in range(0,2*(maxDepth+1),2):
+    #    # Sort so that the branch at this level with the highest Fair Share
+    #    # score comes first.
+    #    if p[i+1] > q[i+1]:
+    #        return -1
+    #    elif p[i+1] < q[i+1]:
+    #        return 1
+    #    # Consider names of branches, but not of leaves.
+    #    elif i != 2*maxDepth:
+    #        # ...sort so that if two branches have the same Fair Share scores
+    #        # but different names, the branch with the lexically greater name
+    #        # comes last.
+    #        if p[i] > q[i]:
+    #            return 1
+    #        if p[i] < q[i]:
+    #            return -1
+
+    # The association with the higher Fair Share score comes first
+    if p[-1] > q[-1]:
+        return -1
+    elif p[-1] < q[-1]:
+        return 1
+    # If two entries can't be distinguished by Fair Share score,
+    # put the lexically greatest project code last.
+    elif p[2*maxDepth] > q[2*maxDepth]:
+        return 1
+    elif p[2*maxDepth] < q[2*maxDepth]:
+        return -1
+    # If two entries can be distinguished neither by Fair Share
+    # score nor by project code, put the lexically greatest user
+    # name last.
+    elif p[2*maxDepth + 1] > q[2*maxDepth + 1]:
+        return 1
+    elif p[2*maxDepth + 1] < q[2*maxDepth + 1]:
+        return -1
+   
+    return 0
+
+def main():
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-M", "--clusters", help="[DEPRECATED] Slurm clusters to which to issue commands (comma separated)")
+    args = parser.parse_args()
+
+    # Get the name of the current cluster
+    thiscluster = ''
+    fairtree = True
+    scontrol_string = ['scontrol', 'show', 'config']
+    scontrol_output = Popen(scontrol_string, stdout=PIPE).communicate()[0].split('\n')
+    for scontrol_line in scontrol_output:
+        if scontrol_line.startswith('ClusterName'):
+            thiscluster = scontrol_line.split()[2]
+        elif scontrol_line.startswith('PriorityFlags'):
+            if 'NO_FAIR_TREE' in scontrol_line.split()[2]:
+                fairtree = False
+    
+    sshare_string = ['sshare']
+    if fairtree:
+        sshare_string.append('-a')
+    else:
+        sshare_string.extend(['-u', 'nobody'])
+    sshare_string.extend(['-n', '-P', '-l'])
+    
+    if args.clusters:
+        print("The -M argument is deprecated and will be ignored. It may be removed in a future release.")
+        print("")
+    #multicluster = False
+    sshare_output = Popen(sshare_string, stdout=PIPE).communicate()[0]
+    sshare_entries = sshare_output.splitlines()
+
+    # Go over all entries and work out how deep (in a tree sense) the deepest
+    # entry is
+    global maxDepth
+    maxDepth = 0
+    for line in sshare_entries:
+        entry = line.split('|')
+
+        account = entry[0]
+        account_stripped = account.lstrip(' ')
+        depth = len(account) - len(account_stripped)
+        if (maxDepth < depth):
+            maxDepth = depth
+
+    previousAccountTree = [''] * (maxDepth + 1)
+    previousScores = [9.999999] * (maxDepth + 1)
+    allEntries = {}
+    allEntries[thiscluster] = []
+    #clusterName = ""
+    for line in sshare_entries:
+        # Get the cluster name
+        #if clusterName == "":
+        #    if multicluster:
+        #        if line.startswith("CLUSTER: "):
+        #            clusterName = line[9:]
+        #            allEntries[clusterName] = []
+        #            continue
+        #        else:
+        #            raise ValueError("expected a line starting with CLUSTER")
+        #    else:
+        #        clusterName = 'ThisCluster'
+        #        allEntries[clusterName] = []
+
+        line_out = []
+        entry = line.split('|')
+
+        account = entry[0]
+        if fairtree:
+            user = entry[1]
+        if account == 'root':
+            entry[2] = '10000'
+            entry[5] = '1.000000'
+            if fairtree:
+                entry[8] = '1.000000'
+        #if entry[2] == 'parent':
+        #    continue
+
+        account_stripped = account.lstrip(' ')
+        depth = len(account) - len(account_stripped)
+        accountTree = [''] * (maxDepth + 1)
+        scores = [9.999999] * (maxDepth + 1)
+
+        for i in range(0,depth):
+            accountTree[i] = previousAccountTree[i]
+            scores[i] = previousScores[i]
+
+        try:
+            rawShares = int(entry[2])
+        except ValueError:
+            rawShares = -1
+        normalisedShares = float(entry[3])
+        rawUsage = int(entry[4])
+        normalisedUsage = float(entry[5])
+        effectiveUsage = float(entry[6])
+        try:
+            fairShareScore = float(entry[7])
+        except ValueError:
+            fairShareScore = None
+
+        accountTree[depth] = account_stripped
+        scores[depth] = fairShareScore
+        for i in range(depth+1,maxDepth+1):
+            accountTree[i] = ''
+            scores[i] = 9.999999
+
+        for i in range(0,maxDepth+1):
+            line_out.append(accountTree[i])
+            line_out.append(scores[i])
+
+        if fairtree:
+            line_out.extend([account, user, rawShares, normalisedShares, rawUsage, effectiveUsage, fairShareScore])
+        else:
+            line_out.extend([account, rawShares, normalisedShares, rawUsage, effectiveUsage, fairShareScore])
+        allEntries[thiscluster].append(line_out)
+
+        previousAccountTree = list(accountTree)
+        previousScores = list(scores)
+
+    sortedEntries = {}
+    for clusterName in allEntries.keys():
+        if fairtree:
+            sortedEntries[clusterName] = sorted(allEntries[clusterName], cmp=compare_sshare_entries_ft)
+        else:
+            sortedEntries[clusterName] = sorted(allEntries[clusterName], cmp=compare_sshare_entries)
+
+        #if multicluster:
+        #    print("CLUSTER: {0}".format(clusterName))
+        if fairtree:
+            print("Account              User                       RawShares  NormShares    RawUsage  EffectvUsage  FairShare")
+            print("-------------------- -------------------------- ---------- ----------- ----------- ------------- ----------")
+            info_start = -7
+            output_format = "{0:<20s} {1:<26s} {2:>10s} {3:>11f} {4:>11d} {5:>13f} {6:>10s}"
+        else:
+            print("Account              RawShares  NormShares    RawUsage  EffectvUsage  FairShare")
+            print("-------------------- ---------- ----------- ----------- ------------- ----------")
+            info_start = -6
+            output_format = "{0:<20s} {1:>10s} {2:>11f} {3:>11d} {4:>13f} {5:>10s}"
+        for entry in sortedEntries[clusterName]:
+            #print(entry)
+            info = entry[info_start:]
+            if fairtree:
+                info[0] = info[0].lstrip(' ')
+            #if info[0] == 'root':
+            #    info[1] = 'all'
+            if info[-5] == -1:
+                info[-5] = 'parent'
+            else:
+                info[-5] = str(info[-5])
+            if info[-1] is None:
+                continue
+            elif info[-1] == sys.float_info.max:
+                info[-1] = 'inf'
+            else:
+                info[-1] = str(info[-1])
+            print(output_format.format(*info))
+        #if multicluster and len(allEntries.keys()) > 1:
+        #    print("")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,242 @@
+#!/bin/bash
+
+function confirm_execution() {
+	while true
+	do
+		${ECHO} -n "${1} (y/n) " | ${FOLD} -s -w 78
+		read response
+		response=$(${ECHO} "${response}" | ${TR} '[:upper:]' '[:lower:]')
+		if [[ "${response}" == "n" ]]
+		then
+			${ECHO} "Exiting."
+			exit 0
+		elif [[ "${response}" == "y" ]]
+		then
+			break
+		else
+			${ECHO} "Bad response: \"${response}\""
+		fi
+	
+	done
+}
+
+function confirm_execution_as_root() {
+	${ECHO} "WARNING: You appear to be running this script as root. Therefore, in order to"
+	${ECHO} "set new ACLs with correct file permissions, you must temporarily revoke"
+	${ECHO} "all existing ACLs. (This is an \"undocumented feature\" of the interplay between"
+	${ECHO}	"POSIX permissions and GPFS ACLs; don't ask.) Unless this is the first time ACLs"
+	${ECHO} "are being set on this directory, we recommend that, in order to minimise"
+	${ECHO} "disruption to users and running jobs, you instead find a person who is"
+	${ECHO} "authorised to modify this directory's ACLs and ask that person to make the"
+	${ECHO} "desired changes. You can find out who is authorised to modify ACLS by running"
+	${ECHO} "the command \"${MMFSBIN}/mmgetacl .\"."
+	${ECHO} ""
+	confirm_execution "Do you wish to continue anyway?"
+	find_user_string=""
+	${ECHO} ""
+}
+
+function confirm_proposed_acl() {
+	
+	if [[ "${1}" != "set" && "${1}" != "add" && "${1}" != "delete" ]]
+	then
+		${ECHO} "Error: bad input to confirm_proposed_acl (${1}), expected one of: set, add, delete" >&2
+		return 1
+	fi
+	
+	#${ECHO} "If you are setting ACLs on a project directory for the first time, please"
+	#${ECHO} "consider giving the project owner explicit permission to write to files and"
+	#${ECHO} "modify ACLs. It is not enough to rely on UNIX file ownership, as not all files"
+	#${ECHO} "created under this project will necessarily be owned by the project owner."
+	#${ECHO} ""
+	${ECHO} "Your proposed ACL is as follows:"
+	${ECHO} ""
+	${CAT}  "${aclfile}"
+	${ECHO} ""
+	confirm_execution "Are you satisfied with your proposed ACL, and do you wish to continue?"
+	${ECHO} ""
+}
+
+function errexit() {
+	${ECHO} "An error occurred on or near line $1!"
+	remove_inappropriate_execute_permissions
+	exit 2
+}
+
+function find_verbose_or_terse() {
+	# -execdir and -exec options are buggy and will break if attempted
+	# on a directory containing too many (> ulimit -n) files.
+	# Try using print0 and xargs instead
+	command_args="-print0 | ${XARGS}"
+	if [[ "${verbose}" == "true" ]]
+	then
+		command_args="${command_args} -t"
+	fi
+	command_args="${command_args} -0 -n 1 -I {} $1 {}"
+	${ECHO} "${command_args}"
+}
+
+function remove_inappropriate_execute_permissions() {
+	${ECHO} "Removing any known inappropriate execute permissions..."
+	if [ -s "${nonexec_files}" ]
+	then
+		while IFS= read -r -d '' entry 
+		do
+			${TEST} -e "${entry}" && ${CHMOD} ${vflag} -x "${entry}"
+		done < "${nonexec_files}"
+	fi
+	if [ -r "${nonexec_files}" ]
+	then
+		${RM} "${nonexec_files}"
+	fi
+}
+
+function set_executable_paths() {
+	AWK=/usr/bin/awk
+	CAT=/usr/bin/cat
+	CHMOD=/usr/bin/chmod
+	ECHO=/usr/bin/echo
+	FIND=/usr/bin/find
+	FOLD=/usr/bin/fold
+	GREP=/usr/bin/grep
+	MMFSBIN=/usr/lpp/mmfs/bin
+	MMDELACL=${MMFSBIN}/mmdelacl
+	MMGETACL=${MMFSBIN}/mmgetacl
+	MMPUTACL=${MMFSBIN}/mmputacl
+	RM=/usr/bin/rm
+	SED=/usr/bin/sed
+	TEST=/usr/bin/test
+	TR=/usr/bin/tr
+	UUIDGEN=/usr/bin/uuidgen
+	WHOAMI=/usr/bin/whoami
+	XARGS=/usr/bin/xargs
+}
+
+function terminal_warning() {
+	${ECHO} "Warning: Killing this script before it ends will almost certainly lead to files"
+	${ECHO} "with bad ACLs and inappropriate execute permissions."
+	${ECHO} ""
+	${ECHO} "If you are not already doing so, we suggest you run this script within a"
+	${ECHO} "\"tmux\" or \"screen\" session so that if your local machine shuts down, or you"
+	${ECHO} "are disconnected from the NeSI cluster, the script does not die."
+	${ECHO} ""
+	confirm_execution "Do you wish to continue?"
+	${ECHO} ""
+}
+
+function validate_acl_file_for_adding() {
+
+	local aclfile="${1}"
+	local validated_acl_file="${2}"
+	
+	local entry_types=("user" "group" "other" "mask")
+	
+	local has_mask=false
+	local linecount=0
+	local valid_entries=()
+	while read line
+	do
+		linecount=$(( ${linecount} + 1 ))
+		local out=$(${ECHO} "${line}" | ${SED} -r -e 's/\s*#.*$//g')
+		if [[ -z "${out}" ]]
+		then
+			continue
+		fi
+		IFS=: read -r -a acl_entry <<< "${out}"
+		# There must be exactly three components
+		if [[ "${#acl_entry[@]}" -ne 3 ]]
+		then
+			${ECHO} "Warning: \"${line}\" (line ${linecount}) is not a valid ACL entry and will be skipped"
+			continue
+		fi
+		# The first component must be one of the valid types
+		local good_type=false
+		for entry_type in "${entry_types[@]}"
+		do
+			if [[ "${acl_entry[0]}" == "${entry_type}" ]]
+			then
+				good_type=true
+				if [[ "${acl_entry[0]}" == "mask" ]]
+				then
+					has_mask=true
+				fi
+				break
+			fi
+		done
+		if [[ "${good_type}" == "false" ]]
+		then
+			${ECHO} "Warning: \"${line}\" (line ${linecount}) is not a valid ACL entry and will be skipped"
+			continue
+		fi
+		# If the first component is other or mask, the second component must be
+		# the empty string
+		if [[ "${acl_entry[0]}" == "other" || "${acl_entry[0]}" == "mask" ]]
+		then
+			if [[ -n "${acl_entry[1]}" ]]
+			then
+				${ECHO} "Warning: \"${line}\" (line ${linecount}) is not a valid ACL entry and will be skipped"
+				continue
+			fi
+		fi
+		# Check the third component
+		local acl_mask=( $(${ECHO} "${acl_entry[2]}" | ${GREP} -o .) )
+		local good_mask=true
+		if [[ "${#acl_mask[@]}" -ne 4 ]]
+		then
+			good_mask=false
+		elif [[ "${acl_mask[0]}" != "r" && "${acl_mask[0]}" != "-" ]]
+		then
+			good_mask=false
+		elif [[ "${acl_mask[1]}" != "w" && "${acl_mask[1]}" != "-" ]]
+		then
+			good_mask=false
+		elif [[ "${acl_mask[2]}" != "x" && "${acl_mask[2]}" != "-" ]]
+		then
+			good_mask=false
+		elif [[ "${acl_mask[3]}" != "c" && "${acl_mask[3]}" != "-" ]]
+		then
+			good_mask=false
+		fi
+		if [[ "${good_mask}" == "false" ]]
+		then
+			${ECHO} "Warning: \"${line}\" (line ${linecount}) is not a valid ACL entry and will be skipped"
+			continue
+		fi
+		local entry_key="${acl_entry[0]}:${acl_entry[1]}"
+		local preexisting_entry
+		if [[ "${#valid_entries[@]}" -eq 0 ]]
+		then
+			valid_entries=( "${entry_key}" )
+		else
+			for preexisting_entry in "${valid_entries[@]}"
+			do
+				if [[ "${entry_key}" == "${preexisting_entry}" ]]
+				then
+					${ECHO} "Error: Multiple valid entries in ACL file for ${entry_key}!"
+					return 2
+				else
+					valid_entries+=("${entry_key}")
+				fi
+			done
+		fi
+		${ECHO} "${out}" >> "${validated_acl_file}"
+		
+	done < ${aclfile}
+	
+	if [[ "${has_mask}" == "false" ]]
+	then
+		${ECHO} "You are not proposing to add an ACL mask, or update an existing ACL mask. Any"
+		${ECHO} "selected file or directory that does not already have an ACL mask will therefore"
+		${ECHO} "cause an error. Moreover, if a file's existing ACL mask is not permissive"
+		${ECHO} "enough, the ACLs you are adding will not have their full effect."
+		${ECHO} ""
+		${ECHO} "To avoid these problems, we suggest starting your list of ACLs to add with the"
+		${ECHO} "following line:"
+		${ECHO} ""
+		${ECHO} "mask::rwxc"
+		${ECHO} ""
+		confirm_execution "Do you wish to continue anyway?"
+		${ECHO} ""
+	fi
+	return 0
+}

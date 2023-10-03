@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+
+import sys, os
+import pwd, grp
+
+OK = 0
+WARNING = 1
+ERROR = 2
+
+exitcode = OK
+
+scriptdir = os.path.dirname(os.path.realpath(__file__))
+whitelist_path = os.path.join(scriptdir, 'home_directory_whitelist.txt')
+home_path = os.path.join(os.sep, 'home')
+
+# Prepare a whitelist
+# An item goes on the whitelist if either the owner or the group is
+# expected to be different to the directory name
+# But we must state what the "correct" answer to both is
+whitelist = []
+wl_count = 0
+with open(whitelist_path) as wl:
+    for wl_line in wl:
+        wl_count += 1
+        wl_line2 = wl_line.rstrip('\n')
+        wl_line3 = wl_line2.strip()
+        # Skip comments
+        if wl_line3.startswith("#"):
+            continue
+        whitelist_entry = wl_line3.split()
+        # Check to make sure this directory is not already present
+        for foo in whitelist:
+            if foo[0] == whitelist_entry[0]:
+                sys.stderr.write("Warning: {0} (line {1}): Duplicate entry. Skipping.\n".format(whitelist_path, wl_count))
+                exitcode = max([exitcode, WARNING])
+                continue
+        if len(whitelist_entry) < 4:
+            sys.stderr.write("Warning: {0} (line {1}): incomplete entry. Skipping.\n".format(whitelist_path, wl_count))
+            exitcode = max([exitcode, WARNING])
+            continue
+        try:
+            pwd.getpwnam(whitelist_entry[1])
+        except KeyError:
+            sys.stderr.write("Warning: {0} (line {1}): invalid user (\"{2}\"). Skipping.\n".format(whitelist_path, wl_count, whitelist_entry[1])) 
+            exitcode = max([exitcode, WARNING])
+            continue
+        try:
+            grp.getgrnam(whitelist_entry[2])
+        except KeyError:
+            sys.stderr.write("Warning: {0} (line {1}): invalid group (\"{2}\").Skipping.\n".format(whitelist_path, wl_count, whitelist_entry[2]))
+            exitcode = max([exitcode, WARNING])
+            continue
+        whitelist.append(whitelist_entry[0:4])
+
+print("Auditing ownership and security of directories in {0} ...".format(home_path))
+
+# Get a list of directories in /home and sort the list
+directories = [f for f in os.listdir(home_path) if os.path.isdir(os.path.join(home_path, f))]
+directories.sort()
+
+for d in directories:
+    directory = os.path.join(home_path, d)
+    stat_info = os.stat(directory)
+    try:
+        username = pwd.getpwuid(stat_info.st_uid).pw_name
+    except KeyError:
+        username = stat_info.st_uid
+    try:
+        groupname = grp.getgrgid(stat_info.st_gid).gr_name
+    except KeyError:
+        groupname = stat_info.st_gid
+    mode = stat_info.st_mode
+    permissions = ['d'] +  ['-'] * 9
+    # 0o00001 = world-executable
+    if mode & 0o00001:
+        # 0o01000 = sticky bit
+        if mode & 0o01000:
+            permissions[9] = 't'
+        else:
+            permissions[9] = 'x'
+    elif mode & 0o01000:
+        permissions[9] = 'T'
+    # 0o00002 = world-writable
+    if mode & 0o00002:
+        permissions[8] = 'w'
+    # 0o00004 = world-readable
+    if mode & 0o00004:
+        permissions[7] = 'r'
+    # 0o00010 = group-executable
+    if mode & 0o00010:
+        # 0o02000 = setgid bit
+        if mode & 0o02000:
+            permissions[6] = 's'
+        else:
+            permissions[6] = 'x'
+    elif mode & 0o02000:
+        permissions[6] = 'S'
+    # 0o00020 = group-writable
+    if mode & 0o00020:
+        permissions[5] = 'w'
+    # 0o00040 = group-readable
+    if mode & 0o00040:
+        permissions[4] = 'r'
+    # 0o00100 = owner-executable
+    if mode & 0o00100:
+        # 0o04000 = setuid bit
+        if mode & 0o04000:
+            permissions[3] = 's'
+        else:
+            permissions[3] = 'x'
+    elif mode & 0o04000:
+        permissions[3] = 'S'
+    # 0o00200 = owner-writable
+    if mode & 0o00200:
+        permissions[2] = 'w'
+    # 0o00400 = owner-readable
+    if mode & 0o00400:
+        permissions[1] = 'r'
+    permissions_string = ''.join(permissions)
+
+    expected_owner = d
+    expected_group = d
+    expected_permissions = 'drwx--S---'
+    for we in whitelist:
+        if we[0] == d:
+            in_whitelist = True
+            expected_owner = we[1]
+            expected_group = we[2]
+            expected_permissions = we[3]
+            break
+
+    if username != expected_owner:
+        print("Directory {0} has bad ownership (expected: {1}, found: {2})".format(directory, expected_owner, username))
+    if groupname != expected_group:
+        print("Directory {0} has a bad group (expected: {1}, found: {2})".format(directory, expected_group, groupname))
+    if permissions_string != expected_permissions:
+        print("Directory {0} has bad permissions (expected: {1}, found: {2})".format(directory, expected_permissions, permissions_string))
+
+sys.exit(exitcode)

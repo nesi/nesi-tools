@@ -1,0 +1,130 @@
+#!/bin/bash
+
+# nn_dir_contents
+# NIWA/NeSI directory contents report
+#
+# A script to print directory size (disk space) and number of directory entries
+# (files, subdirectories, symbolic links, etc.) contained within a specific
+# directory. If no directory is given as an argument, the current working
+# directory will be analysed.
+#
+# Copyright (C) 2022 Landcare Research New Zealand Ltd. All rights reserved.
+#
+# This script is made available to users of the NeSI systems for their use
+# on those systems. It is not to be reproduced or used elsewhere without
+# the permission of the copyright owner.
+#
+progname=$(basename $0)
+print_usage() {
+	echo "usage: $progname [ -n | -s ] [--] [ DIR [ DIR ... ] ]"
+	echo "       $progname -h"
+}
+
+# Execute getopt
+ARGS=$(getopt -o hns -l "help,num-contents,size" -n "$progname" -- "$@");
+if [ $? -ne 0 ]
+then
+	exit 1
+fi
+
+report_size=true
+report_num_contents=true
+ 
+eval set -- "$ARGS"
+ 
+while true
+do
+	case "$1" in
+		-n|--num-contents)
+			report_size=false
+			shift
+			;;
+		-h|--help)
+			print_usage
+			exit 0
+			;;
+		-s|--size)
+			report_num_contents=false
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+	esac
+done
+
+if [[ "${report_size}" == "false" && "${report_num_contents}" == "false" ]]
+then
+	print_usage
+	exit 2
+fi
+
+print_indent=false
+if [[ "$#" -gt 1 ]]
+then
+	print_indent=true
+elif [[ "$#" -eq 0 ]]
+then
+	eval set "$(/usr/bin/pwd)"
+fi
+
+for directory in "$@"
+do
+	if [[ ! -e "${directory}" ]]
+	then
+		/bin/echo "${directory}: no such file or directory" >&2
+		continue
+	elif [[ ! -d "${directory}" ]]
+	then
+		/bin/echo "${directory}: not a directory" >&2
+		continue
+	elif [[ ! -r "${directory}" ]]
+	then
+		/bin/echo "${directory}: permission denied" >&2
+		continue
+	fi
+	if [[ "${report_size}" == "true" ]]
+	then
+		size=$(/usr/bin/du -hs "${directory}" | /usr/bin/awk '{print $1}')
+		if [[ "${print_indent}" == "true" ]]
+		then
+			if [[ "${report_num_contents}" == "false" ]]
+			then
+				/usr/bin/printf "%-48s	%s\n" "${directory}" "${size}"
+			else
+				echo "${directory}"
+				/usr/bin/printf "	Size:			${size}\n"
+			fi
+		else
+			if [[ "${report_num_contents}" == "false" ]]
+			then
+				echo "${size}"
+			else
+				/usr/bin/printf "Size:			${size}\n"
+			fi
+		fi
+	fi
+	if [[ "${report_num_contents}" == "true" ]]
+	then
+		num_newlines=$(/usr/bin/find "${directory}" -mindepth 1 -true -print0 | /usr/bin/wc -l)
+		num_files_plus_newlines=$(/usr/bin/find "${directory}" -mindepth 1 -true -print | /usr/bin/wc -l)
+		num_files=$(( ${num_files_plus_newlines} - ${num_newlines} ))
+		if [[ "${print_indent}" == "true" ]]
+		then
+			if [[ "${report_size}" == "false" ]]
+			then
+				/usr/bin/printf "%-48s	%s\n" "${directory}" "${num_files}"
+			else
+				/usr/bin/printf "	Number of files:	${num_files}\n"
+			fi
+		else
+			if [[ "${report_size}" == "false" ]]
+			then
+				echo "${num_files}"
+			else
+				/usr/bin/printf "Number of files:	${num_files}\n"
+			fi
+		fi
+	fi
+done
