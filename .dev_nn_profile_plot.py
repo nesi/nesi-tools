@@ -18,13 +18,6 @@ Options:
   --jobid=j  Job ID from which to look up step names.
 
 """
-
-try:
-    import h5py
-except ImportError:
-    print("Do 'module load Python' to get a version with HDF5 support")
-    raise
-
 import matplotlib
 from subprocess import check_output
 from matplotlib import pyplot as plt, colors, ticker
