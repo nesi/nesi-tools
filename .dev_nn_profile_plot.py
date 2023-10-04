@@ -77,7 +77,6 @@ def pick_mega_scale(max_value, max_number=1000):
 
 # COMMAND LINE ARGUMENTS
 
-
 args = docopt(__doc__)
 fn = args["FILE"]
 specified_steps = args["<step_name>"]
@@ -88,6 +87,9 @@ if job_id is None:
     m = re.match("job_([0-9_]+).h5", fn)
     if m is not None:
         (job_id,) = m.groups()
+
+# Message so user knows whats happening.
+print(f"Plotting '{fn}'...")
 
 # OVERALL COUNT OF STEPS / TASKS
 
@@ -298,5 +300,6 @@ if colour_by_step:
     fig.legend(handles, labels, borderaxespad=0.1, loc="center right", frameon=False)
 
 # OUTPUT
-
-plt.savefig(fn.split("/")[-1].split(".")[0] + "_profile.png")
+outname = fn.split("/")[-1].split(".")[0] + "_profile.png"
+plt.savefig(outname)
+print(f"Output saved to '{outname}'.")
