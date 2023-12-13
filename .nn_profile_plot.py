@@ -25,6 +25,7 @@ from docopt import docopt
 import numpy
 import math
 import re
+import h5py
 
 to_rgba = colors.ColorConverter().to_rgba
 matplotlib.use("agg")
