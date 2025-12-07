@@ -1,2 +1,3 @@
 # nesi-tools
-Scripts from `/opt/nesi/bin`
+
+Now using https://github.com/nesi/opt-nesi-bin 
